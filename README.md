@@ -1,5 +1,9 @@
 # Spitfire
 
+<p align="center">
+  <img src="imgs/spitfire_v1.webp" alt="Spitfire" width="280">
+</p>
+
 **Standalone** Node.js module for running LLMs locally. No external dependencies required - includes both WebAssembly and WebGPU inference engines built from scratch.
 
 ## Features
