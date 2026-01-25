@@ -173,18 +173,25 @@ export function dispatchCompute(
 }
 
 /**
- * Execute a compute shader and wait for completion
+ * Execute a compute shader
+ * By default, submits without waiting (async GPU execution)
+ * Set sync=true only when you need to read results immediately
  */
 export async function executeCompute(
   pipeline: GPUComputePipeline,
   bindGroups: GPUBindGroup[],
   workgroupCounts: [number, number, number],
-  label?: string
+  label?: string,
+  sync = false
 ): Promise<void> {
   const gpuDevice = getWebGPUDevice();
   const commandBuffer = dispatchCompute(pipeline, bindGroups, workgroupCounts, label);
   gpuDevice.submit([commandBuffer]);
-  await gpuDevice.sync();
+  // Only sync when explicitly requested (e.g., before reading buffer)
+  // GPU commands are still executed in order, just not waited on
+  if (sync) {
+    await gpuDevice.sync();
+  }
 }
 
 /**

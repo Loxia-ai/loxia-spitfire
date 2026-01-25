@@ -33,6 +33,7 @@ nunjucksEnv.addFilter('tojson', (obj: unknown) => JSON.stringify(obj));
 
 export interface WebGPUEngineOptions {
   numThreads?: number; // Ignored for WebGPU (GPU handles parallelism)
+  debug?: boolean; // Enable verbose debug output (slower due to GPU-CPU transfers)
 }
 
 export interface WebGPULoadModelOptions {
@@ -53,6 +54,18 @@ export interface WebGPUGenerateOptions {
 // Use LlamaWeights from model loader
 // Re-export for backward compatibility
 type ModelWeights = LlamaWeights;
+
+/**
+ * KV Cache for storing key/value projections across generation steps
+ * This avoids recomputing attention for previously processed tokens
+ */
+interface KVCache {
+  // Each layer has its own K and V cache
+  // Shape: [seqLen, numKVHeads * headDim]
+  keys: Float32Array[];    // One per layer
+  values: Float32Array[];  // One per layer
+  seqLen: number;          // Current cached sequence length
+}
 
 /**
  * WebGPU-accelerated inference engine
@@ -79,10 +92,15 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   private ropeBase = 10000.0;
   private chatTemplate: string | null = null;
 
-  constructor(_options: WebGPUEngineOptions = {}) {
+  // Debug mode - when false, skips expensive GPU-CPU transfers for logging
+  private debugMode = false;
+
+  // KV cache for efficient incremental generation
+  private kvCache: KVCache | null = null;
+
+  constructor(options: WebGPUEngineOptions = {}) {
     super();
-    // Options reserved for future configuration
-    void _options;
+    this.debugMode = options.debug ?? false;
   }
 
   /**
@@ -288,6 +306,25 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
+   * Create a new empty KV cache
+   */
+  private createKVCache(): KVCache {
+    const numLayers = this.weights?.layers.length || this.numLayers;
+    return {
+      keys: Array(numLayers).fill(null).map(() => new Float32Array(0)),
+      values: Array(numLayers).fill(null).map(() => new Float32Array(0)),
+      seqLen: 0,
+    };
+  }
+
+  /**
+   * Clear the KV cache (call when starting a new generation)
+   */
+  private clearKVCache(): void {
+    this.kvCache = null;
+  }
+
+  /**
    * Compute debug statistics for an array
    */
   private debugStats(arr: Float32Array | number[], label: string): void {
@@ -312,25 +349,53 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
   /**
    * Forward pass through the model
+   * @param inputIds - Token IDs to process
+   * @param useCache - If true, use KV cache for incremental generation (only process last token)
    */
-  private async forward(inputIds: number[]): Promise<Float32Array> {
+  private async forward(inputIds: number[], useCache = false): Promise<Float32Array> {
     if (!this.weights) {
       throw new Error('Model weights not loaded');
     }
 
-    const seqLen = inputIds.length;
-    const DEBUG = seqLen <= 82;
+    const fullSeqLen = inputIds.length;
+    const DEBUG = this.debugMode;
+
+    // For cached inference, we only process new tokens
+    // startPos is where new tokens start (= cached sequence length)
+    let startPos = 0;
+    let tokensToProcess: number[];
+
+    if (useCache && this.kvCache && this.kvCache.seqLen > 0) {
+      // Incremental mode: only process the last token
+      startPos = this.kvCache.seqLen;
+      tokensToProcess = inputIds.slice(startPos);
+      if (DEBUG) {
+        console.log(`\n[Forward] Incremental: processing ${tokensToProcess.length} new token(s) at pos ${startPos}`);
+      }
+    } else {
+      // Full mode: process all tokens (prefill)
+      tokensToProcess = inputIds;
+      // Initialize or reset cache
+      if (useCache) {
+        this.kvCache = this.createKVCache();
+      }
+      if (DEBUG) {
+        console.log(`\n[Forward] Prefill: processing ${tokensToProcess.length} tokens`);
+      }
+    }
+
+    const processLen = tokensToProcess.length;
 
     // Debug: log input token IDs for first call
     if (DEBUG) {
-      console.log(`\n[Forward] seqLen=${seqLen}, first 5 tokens: [${inputIds.slice(0, 5).join(', ')}], last 5 tokens: [${inputIds.slice(-5).join(', ')}]`);
+      console.log(`[Forward] seqLen=${fullSeqLen}, first 5 tokens: [${inputIds.slice(0, 5).join(', ')}], last 5 tokens: [${inputIds.slice(-5).join(', ')}]`);
     }
 
-    // Create input embeddings using proper embedding lookup
+    // Create input embeddings only for tokens we need to process
     // GGUF stores embeddings as [hiddenSize, vocabSize], pass vocabSize hint
     let hidden: Tensor;
     if (this.weights.tokenEmbedding) {
-      hidden = await ops.embeddingLookup(this.weights.tokenEmbedding, inputIds, this.vocabSize);
+      hidden = await ops.embeddingLookup(this.weights.tokenEmbedding, tokensToProcess, this.vocabSize);
 
       // Debug: check if embeddings are different per position
       if (DEBUG) {
@@ -339,17 +404,17 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         const pos0 = Array.from(embData.slice(0, 5));
         const posLast = Array.from(embData.slice(-this.hiddenSize, -this.hiddenSize + 5));
         console.log(`[Forward] Embedding pos 0: [${pos0.map((v: number) => v.toFixed(4)).join(', ')}]`);
-        console.log(`[Forward] Embedding pos ${seqLen - 1}: [${posLast.map((v: number) => v.toFixed(4)).join(', ')}]`);
+        console.log(`[Forward] Embedding pos ${processLen - 1}: [${posLast.map((v: number) => v.toFixed(4)).join(', ')}]`);
       }
     } else {
       // Fallback to random embeddings (shouldn't happen with real model)
       console.warn('No token embedding found, using random');
-      hidden = Tensor.random([seqLen, this.hiddenSize], { label: 'hidden' });
+      hidden = Tensor.random([processLen, this.hiddenSize], { label: 'hidden' });
     }
 
     // Process through all layers
-    for (let i = 0; i < this.weights.layers.length; i++) {
-      const layer = this.weights.layers[i];
+    for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
+      const layer = this.weights.layers[layerIdx];
 
       // Skip layers without required weights
       if (!layer.attnNorm || !layer.ffnNorm) {
@@ -360,7 +425,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       const normed = await rmsNorm(hidden, layer.attnNorm, this.rmsNormEps);
 
       // Debug: check normalized input for layer 0
-      if (i === 0 && DEBUG) {
+      if (layerIdx === 0 && DEBUG) {
         const normedData = await normed.toArray();
         this.debugStats(normedData, 'L0 Normed');
         const sample = Array.from(normedData.slice(0, 8));
@@ -370,15 +435,15 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // Self-attention with Q, K, V projections
       let attnOut: Tensor;
       if (layer.attnQ && layer.attnK && layer.attnV && layer.attnOutput) {
-        attnOut = await this.selfAttention(normed, layer, seqLen);
+        attnOut = await this.selfAttention(normed, layer, processLen, startPos, layerIdx, useCache);
       } else {
         // Fallback: identity (skip attention)
-        console.warn(`Layer ${i}: missing attention weights, skipping`);
+        console.warn(`Layer ${layerIdx}: missing attention weights, skipping`);
         attnOut = normed;
       }
 
       // Debug: check attention output for last position (layer 0 only)
-      if (i === 0 && DEBUG) {
+      if (layerIdx === 0 && DEBUG) {
         const attnData = await attnOut.toArray();
         this.debugStats(attnData, 'L0 AttnOut');
         const lastPosAttn = Array.from(attnData.slice(-this.hiddenSize, -this.hiddenSize + 8));
@@ -403,7 +468,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         const ffnOut = await feedForward(normed2, layer.ffnGate, layer.ffnUp, layer.ffnDown);
 
         // Debug: check hidden after FFN for last position (layer 0 only)
-        if (i === 0 && DEBUG) {
+        if (layerIdx === 0 && DEBUG) {
           const ffnData = await ffnOut.toArray();
           this.debugStats(ffnData, 'L0 FFNOut');
           const lastPosFfn = Array.from(ffnData.slice(-this.hiddenSize, -this.hiddenSize + 8));
@@ -419,7 +484,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       normed2.destroy();
 
       // Debug: hidden state after layer 0
-      if (i === 0 && seqLen <= 82) {
+      if (layerIdx === 0 && DEBUG) {
         const hiddenData = await hidden.toArray();
         const lastPosHidden = Array.from(hiddenData.slice(-this.hiddenSize, -this.hiddenSize + 8));
         console.log(`[Layer0] Hidden after layer: [${lastPosHidden.map(v => v.toFixed(4)).join(', ')}]`);
@@ -434,54 +499,30 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       normWeight.destroy();
     }
 
-    // Get logits for the last token
-    const finalData = await finalNormed.toArray();
-    const lastTokenData = finalData.slice(-this.hiddenSize);
+    // Extract last token's hidden state on GPU (avoids transferring entire sequence to CPU)
+    const lastTokenHidden = await ops.sliceLastRow(finalNormed);
 
-    // Debug: check final hidden state
+    // Debug: check final hidden state (only when debug enabled)
     if (DEBUG) {
+      const lastTokenData = await lastTokenHidden.toArray();
       this.debugStats(lastTokenData, 'Final Hidden');
       const lastPosVals = Array.from(lastTokenData.slice(0, 8));
       console.log(`[Final] Last token hidden: [${lastPosVals.map(v => v.toFixed(4)).join(', ')}]`);
     }
 
-    const lastTokenHidden = Tensor.fromData(lastTokenData, [1, this.hiddenSize]);
     finalNormed.destroy();
 
     // Output projection
     // outputWeight is pre-transposed to [hiddenSize, vocabSize] = [2048, 151936]
     let logits: Tensor;
     if (this.weights.outputWeight) {
-      // Debug: verify matmul by computing first logit manually
-      if (seqLen <= 82) {
-        const outputData = await this.weights.outputWeight.toArray();
-        console.log(`[DEBUG] outputWeight shape: [${this.weights.outputWeight.shape.join(', ')}]`);
-
-        // Manual computation: logit[0] = sum_i hidden[i] * outputWeight[i, 0]
-        let manualLogit0 = 0;
-        for (let i = 0; i < this.hiddenSize; i++) {
-          // outputWeight is [hiddenSize, vocabSize], so column 0 is at indices 0, vocabSize, 2*vocabSize, ...
-          // Wait, in row-major, element (i, j) is at index i * cols + j
-          // So outputWeight[i, 0] is at index i * vocabSize + 0 = i * vocabSize
-          manualLogit0 += lastTokenData[i] * outputData[i * this.vocabSize];
-        }
-        console.log(`[DEBUG] Manual logit[0] = ${manualLogit0.toFixed(4)}`);
-
-        // Also compute for a specific token like 1 (should be "def" or similar common token)
-        let manualLogit1 = 0;
-        for (let i = 0; i < this.hiddenSize; i++) {
-          manualLogit1 += lastTokenData[i] * outputData[i * this.vocabSize + 1];
-        }
-        console.log(`[DEBUG] Manual logit[1] = ${manualLogit1.toFixed(4)}`);
-      }
-
       logits = await ops.matmul(lastTokenHidden, this.weights.outputWeight);
 
-      // Debug: compare with matmul result
+      // Debug: check logits
       if (DEBUG) {
         const logitsArr = await logits.toArray();
         this.debugStats(logitsArr, 'Logits');
-        console.log(`[DEBUG] Matmul logit[0] = ${logitsArr[0].toFixed(4)}, logit[1] = ${logitsArr[1].toFixed(4)}`);
+        console.log(`[DEBUG] Logit[0] = ${logitsArr[0].toFixed(4)}, logit[1] = ${logitsArr[1].toFixed(4)}`);
       }
     } else {
       // No output weight, create random logits for testing
@@ -498,18 +539,31 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   /**
    * Self-attention with Q, K, V projections
    * Supports Grouped Query Attention (GQA) where numKVHeads < numHeads
+   * Supports KV caching for incremental generation
+   *
+   * @param x - Input tensor [processLen, hiddenSize]
+   * @param layer - Layer weights
+   * @param processLen - Number of tokens being processed (1 for incremental, full for prefill)
+   * @param startPos - Starting position in sequence (0 for prefill, cached length for incremental)
+   * @param layerIdx - Layer index for KV cache access
+   * @param useCache - Whether to use/update KV cache
    */
   private async selfAttention(
     x: Tensor,
     layer: LlamaLayerWeights,
-    seqLen: number
+    processLen: number,
+    startPos: number,
+    _layerIdx: number,
+    _useCache: boolean
   ): Promise<Tensor> {
-    // Project to Q, K, V
-    // Q: [seqLen, hiddenSize] @ [hiddenSize, numHeads * headDim] = [seqLen, numHeads * headDim]
+    // Note: layerIdx and useCache are reserved for future GPU-based KV cache implementation
+
+    // Project to Q, K, V for new tokens only
+    // Q: [processLen, hiddenSize] @ [hiddenSize, numHeads * headDim] = [processLen, numHeads * headDim]
     let q = await ops.matmul(x, layer.attnQ!);
-    // K: [seqLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [seqLen, numKVHeads * headDim]
+    // K: [processLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [processLen, numKVHeads * headDim]
     let k = await ops.matmul(x, layer.attnK!);
-    // V: [seqLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [seqLen, numKVHeads * headDim]
+    // V: [processLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [processLen, numKVHeads * headDim]
     let vProj = await ops.matmul(x, layer.attnV!);
 
     // Apply biases if present (Qwen uses Q/K/V biases)
@@ -524,7 +578,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
 
     // Debug: check Q, K, V before RoPE
-    const debugRope = seqLen <= 82;
+    const debugRope = this.debugMode;
     let qBeforeRope: number[] | null = null;
     if (debugRope) {
       const qArr = await q.toArray();
@@ -537,115 +591,53 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
 
     // Apply RoPE to Q and K
-    const qRope = await applyRope(q, seqLen, this.numHeads, this.headDim, this.ropeBase);
-    const kRope = await applyRope(k, seqLen, this.numKVHeads, this.headDim, this.ropeBase);
+    // IMPORTANT: RoPE needs absolute positions, not relative to batch
+    // For incremental: Q positions are [startPos, startPos+1, ...], K same
+    const qRope = await applyRope(q, processLen, this.numHeads, this.headDim, this.ropeBase, startPos);
+    const kRope = await applyRope(k, processLen, this.numKVHeads, this.headDim, this.ropeBase, startPos);
     q.destroy();
     k.destroy();
 
-    // Get data for CPU-based multi-head attention
-    const qData = await qRope.toArray();
-    const kData = await kRope.toArray();
-    const vData = await vProj.toArray();
-
     // Debug: check Q after RoPE
     if (debugRope && qBeforeRope) {
+      const qData = await qRope.toArray();
+      const kData = await kRope.toArray();
       this.debugStats(qData, 'Q post-RoPE');
       this.debugStats(kData, 'K post-RoPE');
       const qAfterRope = Array.from(qData.slice(0, 8));
       const qLastPosAfter = Array.from(qData.slice(-this.numHeads * this.headDim, -this.numHeads * this.headDim + 8));
       console.log(`[RoPE] Q pos0 before: [${qBeforeRope.map(v => v.toFixed(4)).join(', ')}]`);
       console.log(`[RoPE] Q pos0 after:  [${qAfterRope.map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`[RoPE] Q pos${seqLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
+      console.log(`[RoPE] Q pos${processLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
     }
 
+    // For now, skip KV cache and compute attention directly on GPU
+    // The CPU-based KV cache was causing too many GPU-CPU transfers
+    // TODO: Implement GPU-based KV cache with pre-allocated buffers
+
+    // GPU-accelerated causal attention
+    // Q: [processLen, numHeads * headDim]
+    // K: [processLen, numKVHeads * headDim] (just new keys for now)
+    // V: [processLen, numKVHeads * headDim] (just new values for now)
+    //
+    // Note: Without proper GPU KV cache, we need to recompute K/V for full sequence
+    // This is O(n²) but avoids the GPU-CPU transfer bottleneck
+    const attnOut = await ops.causalAttention(
+      qRope,
+      kRope,
+      vProj,
+      this.numHeads,
+      this.numKVHeads,
+      this.headDim,
+      startPos
+    );
+
+    // Cleanup
     qRope.destroy();
     kRope.destroy();
     vProj.destroy();
 
-    // Multi-head attention on CPU (correct implementation)
-    // Q: [seqLen, numHeads * headDim] -> reshape to [seqLen, numHeads, headDim]
-    // K: [seqLen, numKVHeads * headDim] -> reshape to [seqLen, numKVHeads, headDim]
-    // V: [seqLen, numKVHeads * headDim] -> reshape to [seqLen, numKVHeads, headDim]
-
-    const scale = 1.0 / Math.sqrt(this.headDim);
-    const kvRatio = this.numHeads / this.numKVHeads; // For GQA
-    const outputData = new Float32Array(seqLen * this.numHeads * this.headDim);
-
-    // Debug: Q values at last position for head 0
-    if (debugRope) {
-      const lastPosQOffset = (seqLen - 1) * this.numHeads * this.headDim;
-      const qLastPos = Array.from(qData.slice(lastPosQOffset, lastPosQOffset + 8));
-      console.log(`[Attn] Q last pos head0: [${qLastPos.map(v => v.toFixed(4)).join(', ')}]`);
-    }
-
-    // Process each head
-    for (let h = 0; h < this.numHeads; h++) {
-      const kvHead = Math.floor(h / kvRatio); // Which KV head this Q head uses
-
-      // For this head, compute attention scores: Q_h @ K_h^T
-      // scores[i][j] = sum_d Q[i][h][d] * K[j][kvHead][d]
-      const scores = new Float32Array(seqLen * seqLen);
-
-      for (let i = 0; i < seqLen; i++) {
-        for (let j = 0; j < seqLen; j++) {
-          let score = 0;
-          for (let d = 0; d < this.headDim; d++) {
-            const qIdx = i * this.numHeads * this.headDim + h * this.headDim + d;
-            const kIdx = j * this.numKVHeads * this.headDim + kvHead * this.headDim + d;
-            score += qData[qIdx] * kData[kIdx];
-          }
-          scores[i * seqLen + j] = score * scale;
-        }
-      }
-
-      // Apply causal mask and softmax for each query position
-      for (let i = 0; i < seqLen; i++) {
-        // Apply causal mask: can only attend to positions <= i
-        let maxScore = -Infinity;
-        for (let j = 0; j <= i; j++) {
-          if (scores[i * seqLen + j] > maxScore) {
-            maxScore = scores[i * seqLen + j];
-          }
-        }
-
-        // Compute softmax
-        let sumExp = 0;
-        const expScores = new Float32Array(seqLen);
-        for (let j = 0; j <= i; j++) {
-          expScores[j] = Math.exp(scores[i * seqLen + j] - maxScore);
-          sumExp += expScores[j];
-        }
-        for (let j = 0; j <= i; j++) {
-          expScores[j] /= sumExp;
-        }
-
-        // Debug: show attention scores and weights for last position, head 0
-        if (h === 0 && i === seqLen - 1 && seqLen <= 82) {
-          const rawScores = Array.from(scores.slice(i * seqLen, i * seqLen + Math.min(8, seqLen)));
-          const attnWeights = Array.from(expScores.slice(0, Math.min(8, seqLen)));
-          console.log(`[Attn] Raw scores last pos head0: [${rawScores.map(v => v.toFixed(4)).join(', ')}]`);
-          console.log(`[Attn] Weights last pos head0: [${attnWeights.map(v => v.toFixed(4)).join(', ')}]`);
-        }
-
-        // Compute attention output: sum_j attn[i][j] * V[j][kvHead][:]
-        for (let d = 0; d < this.headDim; d++) {
-          let val = 0;
-          for (let j = 0; j <= i; j++) {
-            const vIdx = j * this.numKVHeads * this.headDim + kvHead * this.headDim + d;
-            val += expScores[j] * vData[vIdx];
-          }
-          const outIdx = i * this.numHeads * this.headDim + h * this.headDim + d;
-          outputData[outIdx] = val;
-        }
-      }
-    }
-
-    // Create output tensor and apply output projection
-    const attnOut = Tensor.fromData(outputData, [seqLen, this.numHeads * this.headDim], {
-      label: 'attn_out',
-    });
-
-    // Output projection: [seqLen, numHeads * headDim] @ [numHeads * headDim, hiddenSize]
+    // Output projection: [processLen, numHeads * headDim] @ [numHeads * headDim, hiddenSize]
     const projected = await ops.matmul(attnOut, layer.attnOutput!);
     attnOut.destroy();
 
@@ -653,7 +645,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
-   * Sample next token from logits
+   * Sample next token from logits using efficient top-k selection
+   * Uses a min-heap for O(vocab) top-k selection instead of O(vocab × k)
    */
   private sampleToken(
     logits: Float32Array,
@@ -661,8 +654,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     topK: number
   ): number {
     const vocabSize = logits.length;
+    const k = Math.min(topK, vocabSize);
 
-    // Find max logit (avoid spread operator for large arrays)
+    // Find max logit for numerical stability
     let maxLogit = -Infinity;
     for (let i = 0; i < vocabSize; i++) {
       if (logits[i] > maxLogit) {
@@ -670,62 +664,83 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
     }
 
-    // Apply temperature and softmax in one pass
-    const probs = new Float32Array(vocabSize);
-    let sum = 0;
-    for (let i = 0; i < vocabSize; i++) {
-      const scaled = (logits[i] - maxLogit) / temperature;
-      probs[i] = Math.exp(scaled);
-      sum += probs[i];
-    }
+    // Use a min-heap to efficiently find top-k elements in O(vocab × log(k))
+    // Heap stores {prob, idx} pairs, sorted by prob ascending (so we can remove smallest)
+    const heap: { prob: number; idx: number }[] = [];
 
-    // Normalize
-    for (let i = 0; i < vocabSize; i++) {
-      probs[i] /= sum;
-    }
+    // Helper functions for min-heap
+    const heapPush = (item: { prob: number; idx: number }) => {
+      heap.push(item);
+      let i = heap.length - 1;
+      while (i > 0) {
+        const parent = Math.floor((i - 1) / 2);
+        if (heap[parent].prob <= heap[i].prob) break;
+        [heap[parent], heap[i]] = [heap[i], heap[parent]];
+        i = parent;
+      }
+    };
 
-    // Find top-k indices efficiently (partial sort)
-    // Use a simple approach: find top-k by scanning
-    const topKIndices: number[] = [];
-    const topKProbs: number[] = [];
-    const used = new Set<number>();
-
-    for (let k = 0; k < Math.min(topK, vocabSize); k++) {
-      let maxIdx = -1;
-      let maxProb = -Infinity;
-      for (let i = 0; i < vocabSize; i++) {
-        if (!used.has(i) && probs[i] > maxProb) {
-          maxProb = probs[i];
-          maxIdx = i;
+    const heapPop = () => {
+      const result = heap[0];
+      const last = heap.pop()!;
+      if (heap.length > 0) {
+        heap[0] = last;
+        let i = 0;
+        while (true) {
+          const left = 2 * i + 1;
+          const right = 2 * i + 2;
+          let smallest = i;
+          if (left < heap.length && heap[left].prob < heap[smallest].prob) {
+            smallest = left;
+          }
+          if (right < heap.length && heap[right].prob < heap[smallest].prob) {
+            smallest = right;
+          }
+          if (smallest === i) break;
+          [heap[i], heap[smallest]] = [heap[smallest], heap[i]];
+          i = smallest;
         }
       }
-      if (maxIdx >= 0) {
-        topKIndices.push(maxIdx);
-        topKProbs.push(maxProb);
-        used.add(maxIdx);
+      return result;
+    };
+
+    // Single pass: compute scaled logits and maintain top-k heap
+    for (let i = 0; i < vocabSize; i++) {
+      const scaled = (logits[i] - maxLogit) / temperature;
+      const prob = Math.exp(scaled);
+
+      if (heap.length < k) {
+        heapPush({ prob, idx: i });
+      } else if (prob > heap[0].prob) {
+        heapPop();
+        heapPush({ prob, idx: i });
       }
     }
 
-    // Renormalize top-k
-    let cumSum = 0;
-    for (let i = 0; i < topKProbs.length; i++) {
-      cumSum += topKProbs[i];
+    // Extract top-k from heap (will be in ascending order)
+    const topKItems: { prob: number; idx: number }[] = [];
+    while (heap.length > 0) {
+      topKItems.push(heapPop());
     }
-    for (let i = 0; i < topKProbs.length; i++) {
-      topKProbs[i] /= cumSum;
+    topKItems.reverse(); // Now descending by probability
+
+    // Compute softmax normalization for just the top-k
+    let sum = 0;
+    for (const item of topKItems) {
+      sum += item.prob;
     }
 
     // Sample from top-k
-    const r = Math.random();
+    const r = Math.random() * sum;
     let cumProb = 0;
-    for (let i = 0; i < topKProbs.length; i++) {
-      cumProb += topKProbs[i];
+    for (const item of topKItems) {
+      cumProb += item.prob;
       if (r <= cumProb) {
-        return topKIndices[i];
+        return item.idx;
       }
     }
 
-    return topKIndices[topKIndices.length - 1] || 0;
+    return topKItems[topKItems.length - 1]?.idx || 0;
   }
 
   /**
@@ -744,25 +759,28 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       temperature = 0.8,
       topK = 40,
       stop = [],
+      rawPrompt = false,
     } = options;
+
+    // Apply chat template unless rawPrompt is set
+    const formattedPrompt = rawPrompt ? prompt : this.applyChatTemplate(prompt);
 
     // Tokenize input using proper tokenizer
     let inputIds: number[];
     if (this.tokenizer) {
-      inputIds = this.tokenizer.encode(prompt);
+      inputIds = this.tokenizer.encode(formattedPrompt);
     } else {
       // Fallback to simple byte encoding
-      inputIds = Array.from(prompt).map((c) => c.charCodeAt(0) % this.vocabSize);
+      inputIds = Array.from(formattedPrompt).map((c) => c.charCodeAt(0) % this.vocabSize);
     }
 
     const generatedTokens: number[] = [];
     let generatedText = '';
 
     for (let i = 0; i < maxTokens; i++) {
+      // Process full sequence each time (no KV cache for now - stays on GPU)
       const allIds = [...inputIds, ...generatedTokens];
-
-      // Forward pass
-      const logits = await this.forward(allIds);
+      const logits = await this.forward(allIds, false);
 
       // Sample next token
       const nextToken = this.sampleToken(logits, temperature, topK);
@@ -785,17 +803,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
 
       // Check for stop sequences
+      let shouldStop = false;
       for (const stopSeq of stop) {
         if (generatedText.endsWith(stopSeq)) {
           // Remove stop sequence from output
           generatedText = generatedText.slice(0, -stopSeq.length);
-          return {
-            text: generatedText,
-            tokensGenerated: generatedTokens.length,
-            done: true,
-          };
+          shouldStop = true;
+          break;
         }
       }
+      if (shouldStop) break;
     }
 
     return {
@@ -883,13 +900,12 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     let generatedText = '';
 
     for (let i = 0; i < maxTokens; i++) {
+      // Process full sequence each time (no KV cache for now - stays on GPU)
       const allIds = [...inputIds, ...generatedTokens];
-
-      // Forward pass
-      const logits = await this.forward(allIds);
+      const logits = await this.forward(allIds, false);
 
       // Debug: show logits distribution for first 3 tokens
-      if (i < 3) {
+      if (this.debugMode && i < 3) {
         let minLogit = Infinity, maxLogit = -Infinity, sum = 0;
         for (let j = 0; j < logits.length; j++) {
           if (logits[j] < minLogit) minLogit = logits[j];
@@ -946,23 +962,14 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
-   * Add bias to a 2D tensor (broadcast add)
+   * Add bias to a 2D tensor (broadcast add) - GPU accelerated
    * input: [seqLen, dim], bias: [dim] -> output: [seqLen, dim]
    */
   private async addBias(input: Tensor, bias: Tensor): Promise<Tensor> {
-    const inputData = await input.toArray();
-    const biasData = await bias.toArray();
-    const [seqLen, dim] = input.shape;
-
-    const result = new Float32Array(inputData.length);
-    for (let i = 0; i < seqLen; i++) {
-      for (let j = 0; j < dim; j++) {
-        result[i * dim + j] = inputData[i * dim + j] + biasData[j];
-      }
-    }
-
+    // Use GPU broadcast add - bias is broadcast across seqLen dimension
+    const result = await ops.broadcastAdd(input, bias);
     input.destroy();
-    return Tensor.fromData(result, input.shape, { label: 'bias_add' });
+    return result;
   }
 
   /**
@@ -994,6 +1001,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
    * Unload the model
    */
   async unload(): Promise<void> {
+    // Clear KV cache
+    this.clearKVCache();
+
     if (this.weights) {
       disposeLlamaWeights(this.weights);
       this.weights = null;

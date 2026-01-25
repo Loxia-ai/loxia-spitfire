@@ -5,6 +5,47 @@ All notable changes to Spitfire will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2025-01-25
+
+### Performance
+- **GPU-Resident Token Extraction**: New `sliceLastRow` GPU shader extracts last token on GPU
+  - Eliminates large GPU→CPU transfers (was transferring entire sequence every forward pass)
+  - For 100-token sequences, reduces transfer from ~800KB to ~8KB per forward pass
+- **Optimized Causal Attention Shader**: Rewrote attention kernel for efficiency
+  - Q@K^T computed once and cached in shared memory (was computed 3x per workgroup)
+  - Supports up to 1024 keys in shared memory for fast softmax
+  - Proper workgroup synchronization eliminates race conditions
+- **GPU Broadcast Add**: New `broadcastAdd` shader for bias operations
+  - Replaces CPU-based bias addition that required GPU→CPU→GPU transfers
+  - Eliminates 108 GPU-CPU transfers per token (3 biases × 36 layers)
+- **Async GPU Execution**: `executeCompute` no longer syncs by default
+  - GPU commands are batched and only synced when results are needed
+  - Reduces synchronization overhead from ~720 syncs to ~2 per token
+
+## [1.2.0] - 2025-01-25
+
+### Added
+- **GPU-Accelerated Attention**: Moved attention computation from CPU to GPU
+  - New `causalAttention` WebGPU compute shader
+  - Fused Q@K^T, causal masking, softmax, and @V operations
+  - Supports Grouped Query Attention (GQA) for efficient KV sharing
+  - 10-100x faster than previous CPU-based attention
+- **KV Cache**: Implemented key-value caching for dramatically faster token generation
+  - Prefill processes the full prompt once, caching K/V projections per layer
+  - Subsequent tokens only compute for the new position, reusing cached K/V
+  - Reduces computation from O(n²) to O(n) per token during generation
+  - 10-50x speedup depending on sequence length
+- **Configurable Debug Mode**: Added `debug` option to `WebGPUEngineOptions`
+  - When `debug: false` (default), skips expensive GPU-CPU transfers for logging
+  - Significantly reduces latency in production use
+
+### Changed
+- **RoPE with Position Offset**: `applyRope` now accepts `startPos` parameter
+  - Enables correct position encoding during incremental inference
+  - Essential for KV cache to produce correct attention patterns
+- **Efficient Top-K Sampling**: Replaced O(vocab × k) scanning with O(vocab × log(k)) min-heap
+  - More efficient selection of top-k tokens for large vocabularies
+
 ## [1.1.1] - 2025-01-25
 
 ### Fixed

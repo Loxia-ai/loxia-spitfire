@@ -287,6 +287,85 @@ export const addScalar = (x: Tensor, s: number) => runScalar(x, s, 'add_scalar')
 export const mulScalar = (x: Tensor, s: number) => runScalar(x, s, 'mul_scalar');
 
 // ============================================================================
+// Broadcast Operations
+// ============================================================================
+
+const BROADCAST_ADD_SHADER = `
+// Broadcast add: input[seqLen, dim] + bias[dim] -> output[seqLen, dim]
+struct Params {
+  seqLen: u32,
+  dim: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let totalSize = params.seqLen * params.dim;
+
+  if (idx >= totalSize) { return; }
+
+  // idx = seqIdx * dim + dimIdx
+  let dimIdx = idx % params.dim;
+
+  output[idx] = input[idx] + bias[dimIdx];
+}
+`;
+
+let broadcastAddPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Broadcast add: input[seqLen, dim] + bias[dim] -> output[seqLen, dim]
+ * Adds bias vector to each row of the input matrix
+ */
+export async function broadcastAdd(input: Tensor, bias: Tensor): Promise<Tensor> {
+  if (input.ndim !== 2) {
+    throw new Error('broadcastAdd: input must be 2D');
+  }
+  if (bias.ndim !== 1) {
+    throw new Error('broadcastAdd: bias must be 1D');
+  }
+
+  const [seqLen, dim] = input.shape;
+  if (bias.shape[0] !== dim) {
+    throw new Error(`broadcastAdd: bias size ${bias.shape[0]} doesn't match input dim ${dim}`);
+  }
+
+  if (!broadcastAddPipeline) {
+    broadcastAddPipeline = createComputePipelineFromSource(BROADCAST_ADD_SHADER, {
+      label: 'broadcast_add',
+      entryPoint: 'main',
+    });
+  }
+
+  const output = Tensor.empty([seqLen, dim], { label: 'broadcast_add_output' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([seqLen, dim, 0, 0]),
+    'broadcast_add_params'
+  );
+
+  const bindGroup = createBindGroup(broadcastAddPipeline, 0, [
+    { binding: 0, resource: input.getBuffer() },
+    { binding: 1, resource: bias.getBuffer() },
+    { binding: 2, resource: output.getBuffer() },
+    { binding: 3, resource: params },
+  ]);
+
+  const workgroups = calculateWorkgroups(seqLen * dim, 256);
+  await executeCompute(broadcastAddPipeline, [bindGroup], [workgroups, 1, 1]);
+
+  params.destroy();
+  return output;
+}
+
+// ============================================================================
 // Matrix Multiplication
 // ============================================================================
 
@@ -686,6 +765,8 @@ export function resetOpsPipelines(): void {
   reducePipelines = null;
   softmaxPipeline = null;
   embeddingPipeline = null;
+  broadcastAddPipeline = null;
+  sliceLastRowPipeline = null;
 }
 
 // ============================================================================
@@ -815,13 +896,6 @@ export async function embeddingLookup(
     'embedding_params'
   );
 
-  // Debug: print embedding lookup params
-  if (seqLen <= 82) {
-    console.log(`[EmbLookup] shape=[${dim0}, ${dim1}], vocabSize=${vocabSize}, hiddenSize=${hiddenSize}, transposed=${transposed}`);
-    console.log(`[EmbLookup] First 5 token IDs: [${indices.slice(0, 5).join(', ')}]`);
-    console.log(`[EmbLookup] Token 0 (${indices[0]}) index range: ${indices[0] * hiddenSize} to ${indices[0] * hiddenSize + hiddenSize - 1}`);
-  }
-
   const bindGroup = createBindGroup(embeddingPipeline, 0, [
     { binding: 0, resource: embeddings.getBuffer() },
     { binding: 1, resource: indicesBuffer },
@@ -833,20 +907,296 @@ export async function embeddingLookup(
   const workgroups = calculateWorkgroups(totalElements, 256);
   await executeCompute(embeddingPipeline, [bindGroup], [workgroups, 1, 1]);
 
-  // Debug: verify the output by reading back
-  if (seqLen <= 82) {
-    const outData = await output.toArray();
-    console.log(`[EmbLookup] Output first 8: [${Array.from(outData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
-    // Also verify by reading embedding directly
-    const embData = await embeddings.toArray();
-    const tokenId = indices[0];
-    const directLookup = embData.slice(tokenId * hiddenSize, tokenId * hiddenSize + 8);
-    console.log(`[EmbLookup] Direct lookup token ${tokenId} first 8: [${Array.from(directLookup).map(v => v.toFixed(4)).join(', ')}]`);
-  }
-
   params.destroy();
   indicesBuffer.destroy();
 
+  return output;
+}
+
+// ============================================================================
+// GPU Causal Attention (Fused)
+// ============================================================================
+
+const CAUSAL_ATTENTION_SHADER = `
+// Fused causal attention optimized for GPU
+// Computes: softmax((Q @ K^T) * scale) @ V with causal masking
+// Supports GQA where numKVHeads <= numHeads
+//
+// Strategy: Each thread handles specific OUTPUT dimensions and iterates over all keys
+// This avoids race conditions and allows proper memory coalescing
+
+struct Params {
+  numQPos: u32,      // Number of query positions to process
+  numKeys: u32,      // Total number of key positions
+  numHeads: u32,     // Number of query heads
+  numKVHeads: u32,   // Number of KV heads (for GQA)
+  headDim: u32,      // Dimension per head
+  startPos: u32,     // Starting position for causal mask
+  scale: f32,        // 1/sqrt(headDim)
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> Q: array<f32>;
+@group(0) @binding(1) var<storage, read> K: array<f32>;
+@group(0) @binding(2) var<storage, read> V: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+// Shared memory
+var<workgroup> sharedQ: array<f32, 128>;     // Q vector for this head
+var<workgroup> sharedAttn: array<f32, 1024>; // Attention weights (supports up to 1024 keys)
+var<workgroup> sharedTemp: array<f32, 128>;  // Temp for reduction
+var<workgroup> wgMax: f32;
+var<workgroup> wgSum: f32;
+
+@compute @workgroup_size(128)
+fn main(
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>
+) {
+  let numQPos = params.numQPos;
+  let numKeys = params.numKeys;
+  let numHeads = params.numHeads;
+  let numKVHeads = params.numKVHeads;
+  let headDim = params.headDim;
+  let startPos = params.startPos;
+  let scale = params.scale;
+
+  let workIdx = wid.x;
+  let qPos = workIdx / numHeads;
+  let head = workIdx % numHeads;
+
+  if (qPos >= numQPos) { return; }
+
+  let kvRatio = numHeads / numKVHeads;
+  let kvHead = head / kvRatio;
+
+  let absQPos = startPos + qPos;
+  let validKeys = min(absQPos + 1u, numKeys);
+
+  let tid = lid.x;
+  let WG_SIZE = 128u;
+
+  // ===== Step 1: Load Q into shared memory =====
+  let qBase = qPos * numHeads * headDim + head * headDim;
+  if (tid < headDim) {
+    sharedQ[tid] = Q[qBase + tid];
+  }
+  workgroupBarrier();
+
+  // ===== Step 2: Compute all attention scores Q @ K^T * scale =====
+  // Each thread handles multiple keys
+  var threadMax: f32 = -1.0e+38;
+
+  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
+    var score: f32 = 0.0;
+    let kBase = ki * numKVHeads * headDim + kvHead * headDim;
+    for (var d = 0u; d < headDim; d++) {
+      score += sharedQ[d] * K[kBase + d];
+    }
+    score *= scale;
+    sharedAttn[ki] = score;
+    threadMax = max(threadMax, score);
+  }
+
+  // Reduce to find max
+  sharedTemp[tid] = threadMax;
+  workgroupBarrier();
+
+  for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sharedTemp[tid] = max(sharedTemp[tid], sharedTemp[tid + s]);
+    }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    wgMax = sharedTemp[0];
+  }
+  workgroupBarrier();
+  let globalMax = wgMax;
+
+  // ===== Step 3: Compute softmax: exp(score - max) / sum =====
+  var threadSum: f32 = 0.0;
+
+  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
+    let expVal = exp(sharedAttn[ki] - globalMax);
+    sharedAttn[ki] = expVal;
+    threadSum += expVal;
+  }
+
+  // Reduce to find sum
+  sharedTemp[tid] = threadSum;
+  workgroupBarrier();
+
+  for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sharedTemp[tid] += sharedTemp[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    wgSum = sharedTemp[0];
+  }
+  workgroupBarrier();
+  let globalSum = wgSum;
+
+  // Normalize attention weights
+  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
+    sharedAttn[ki] /= globalSum;
+  }
+  workgroupBarrier();
+
+  // ===== Step 4: Compute output = attn @ V =====
+  // Each thread handles specific output dimensions
+  for (var d = tid; d < headDim; d += WG_SIZE) {
+    var outVal: f32 = 0.0;
+
+    for (var ki = 0u; ki < validKeys; ki++) {
+      let vIdx = ki * numKVHeads * headDim + kvHead * headDim + d;
+      outVal += sharedAttn[ki] * V[vIdx];
+    }
+
+    let outIdx = qPos * numHeads * headDim + head * headDim + d;
+    output[outIdx] = outVal;
+  }
+}
+`;
+
+let causalAttentionPipeline: GPUComputePipeline | null = null;
+
+/**
+ * GPU-accelerated causal attention with GQA support
+ *
+ * @param Q - Query tensor [numQPos, numHeads * headDim]
+ * @param K - Key tensor [numKeys, numKVHeads * headDim]
+ * @param V - Value tensor [numKeys, numKVHeads * headDim]
+ * @param numHeads - Number of query heads
+ * @param numKVHeads - Number of KV heads (for GQA)
+ * @param headDim - Dimension per head
+ * @param startPos - Starting position for queries (for incremental inference)
+ * @returns Output tensor [numQPos, numHeads * headDim]
+ */
+export async function causalAttention(
+  Q: Tensor,
+  K: Tensor,
+  V: Tensor,
+  numHeads: number,
+  numKVHeads: number,
+  headDim: number,
+  startPos: number = 0
+): Promise<Tensor> {
+  if (!causalAttentionPipeline) {
+    causalAttentionPipeline = createComputePipelineFromSource(CAUSAL_ATTENTION_SHADER, {
+      label: 'causal_attention',
+      entryPoint: 'main',
+    });
+  }
+
+  const numQPos = Q.shape[0];
+  const numKeys = K.shape[0];
+  const scale = 1.0 / Math.sqrt(headDim);
+
+  const output = Tensor.empty([numQPos, numHeads * headDim], { label: 'attention_output' });
+
+  // Pack params: numQPos, numKeys, numHeads, numKVHeads, headDim, startPos, scale, pad
+  const paramsData = new ArrayBuffer(32);
+  const paramsView = new DataView(paramsData);
+  paramsView.setUint32(0, numQPos, true);
+  paramsView.setUint32(4, numKeys, true);
+  paramsView.setUint32(8, numHeads, true);
+  paramsView.setUint32(12, numKVHeads, true);
+  paramsView.setUint32(16, headDim, true);
+  paramsView.setUint32(20, startPos, true);
+  paramsView.setFloat32(24, scale, true);
+  paramsView.setUint32(28, 0, true);
+
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'attention_params');
+
+  const bindGroup = createBindGroup(causalAttentionPipeline, 0, [
+    { binding: 0, resource: Q.getBuffer() },
+    { binding: 1, resource: K.getBuffer() },
+    { binding: 2, resource: V.getBuffer() },
+    { binding: 3, resource: output.getBuffer() },
+    { binding: 4, resource: params },
+  ]);
+
+  // One workgroup per (qPos, head) pair
+  const numWorkgroups = numQPos * numHeads;
+  await executeCompute(causalAttentionPipeline, [bindGroup], [numWorkgroups, 1, 1]);
+
+  params.destroy();
+  return output;
+}
+
+// ============================================================================
+// Slice Last Row (for efficient last token extraction)
+// ============================================================================
+
+const SLICE_LAST_ROW_SHADER = `
+struct Params {
+  numRows: u32,
+  numCols: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let numCols = params.numCols;
+  let numRows = params.numRows;
+
+  if (idx >= numCols) { return; }
+
+  // Copy from last row of input to output
+  let lastRowStart = (numRows - 1u) * numCols;
+  output[idx] = input[lastRowStart + idx];
+}
+`;
+
+let sliceLastRowPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Extract the last row of a 2D tensor on GPU
+ * input: [rows, cols] -> output: [1, cols]
+ * This avoids transferring the entire tensor to CPU just to get the last row
+ */
+export async function sliceLastRow(input: Tensor): Promise<Tensor> {
+  if (input.ndim !== 2) {
+    throw new Error('sliceLastRow requires 2D tensor');
+  }
+
+  if (!sliceLastRowPipeline) {
+    sliceLastRowPipeline = createComputePipelineFromSource(SLICE_LAST_ROW_SHADER, {
+      label: 'slice_last_row',
+      entryPoint: 'main',
+    });
+  }
+
+  const [rows, cols] = input.shape;
+  const output = Tensor.empty([1, cols], { label: 'last_row' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([rows, cols, 0, 0]),
+    'slice_last_row_params'
+  );
+
+  const bindGroup = createBindGroup(sliceLastRowPipeline, 0, [
+    { binding: 0, resource: input.getBuffer() },
+    { binding: 1, resource: output.getBuffer() },
+    { binding: 2, resource: params },
+  ]);
+
+  const workgroups = calculateWorkgroups(cols, 256);
+  await executeCompute(sliceLastRowPipeline, [bindGroup], [workgroups, 1, 1]);
+
+  params.destroy();
   return output;
 }
 

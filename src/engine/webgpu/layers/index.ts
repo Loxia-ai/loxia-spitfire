@@ -245,6 +245,10 @@ struct Params {
   headDim: u32,
   numHeads: u32,
   base: f32,
+  startPos: u32,  // Starting position for incremental inference
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -257,6 +261,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let headDim = params.headDim;
   let numHeads = params.numHeads;
   let base = params.base;
+  let startPos = params.startPos;
 
   let totalPairs = seqLen * numHeads * (headDim / 2u);
   let pairIdx = gid.x;
@@ -267,14 +272,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Decode indices
   let halfDim = headDim / 2u;
-  let pos = pairIdx / (numHeads * halfDim);
+  let localPos = pairIdx / (numHeads * halfDim);  // Position within this batch
+  let absPos = startPos + localPos;                // Absolute position in sequence
   let remainder = pairIdx % (numHeads * halfDim);
   let head = remainder / halfDim;
   let d = remainder % halfDim;
 
-  // Compute rotation angle
-  // theta = pos * inv_freq[d] where inv_freq[d] = 1 / base^(2d/headDim)
-  let theta = f32(pos) / pow(base, 2.0 * f32(d) / f32(headDim));
+  // Compute rotation angle using ABSOLUTE position
+  // theta = absPos * inv_freq[d] where inv_freq[d] = 1 / base^(2d/headDim)
+  let theta = f32(absPos) / pow(base, 2.0 * f32(d) / f32(headDim));
   let cosTheta = cos(theta);
   let sinTheta = sin(theta);
 
@@ -282,7 +288,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // x1 = first half (dims 0..halfDim-1)
   // x2 = second half (dims halfDim..headDim-1)
   // Pairs are (0,64), (1,65), (2,66), ... for headDim=128
-  let baseIdx = (pos * numHeads + head) * headDim;
+  let baseIdx = (localPos * numHeads + head) * headDim;
   let idx1 = baseIdx + d;           // First half: 0, 1, 2, ... 63
   let idx2 = baseIdx + d + halfDim; // Second half: 64, 65, 66, ... 127
 
@@ -301,13 +307,20 @@ let ropePipeline: GPUComputePipeline | null = null;
 
 /**
  * Apply Rotary Position Embeddings
+ * @param input - Input tensor [seqLen, numHeads * headDim]
+ * @param seqLen - Number of tokens being processed
+ * @param numHeads - Number of attention heads
+ * @param headDim - Dimension per head
+ * @param base - RoPE base frequency (default 10000)
+ * @param startPos - Starting position for incremental inference (default 0)
  */
 export async function applyRope(
   input: Tensor,
   seqLen: number,
   numHeads: number,
   headDim: number,
-  base = 10000.0
+  base = 10000.0,
+  startPos = 0
 ): Promise<Tensor> {
   if (!ropePipeline) {
     ropePipeline = createComputePipelineFromSource(ROPE_SHADER, {
@@ -318,12 +331,15 @@ export async function applyRope(
 
   const output = Tensor.empty(input.shape, { label: 'rope_output' });
 
-  const paramsData = new ArrayBuffer(16);
+  // Params struct is 32 bytes (8 u32s, with padding for alignment)
+  const paramsData = new ArrayBuffer(32);
   const paramsView = new DataView(paramsData);
   paramsView.setUint32(0, seqLen, true);
   paramsView.setUint32(4, headDim, true);
   paramsView.setUint32(8, numHeads, true);
   paramsView.setFloat32(12, base, true);
+  paramsView.setUint32(16, startPos, true);
+  // Padding at 20, 24, 28
 
   const params = createUniformBufferWithData(new Uint8Array(paramsData), 'rope_params');
 
