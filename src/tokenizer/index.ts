@@ -267,14 +267,17 @@ export class Tokenizer {
     return this.encodeCharacters(symbols);
   }
 
+  // Cache for GPT-2 byte mappings (computed once)
+  private static gpt2ByteToChar: Map<number, string> | null = null;
+  private static gpt2CharToByte: Map<string, number> | null = null;
+
   /**
-   * GPT-2 style byte-to-unicode mapping
-   * Maps bytes to unicode characters to avoid whitespace/control char issues
+   * Initialize GPT-2 byte encoding tables (lazy initialization)
    */
-  private byteToUnicode(byte: number): string {
-    // GPT-2 bytes_to_unicode: maps bytes to unicode chars
-    // Printable ASCII (33-126) and some extended (161-172, 174-255) stay as-is
-    // Others get shifted to avoid control characters
+  private static initGPT2Tables(): void {
+    if (Tokenizer.gpt2ByteToChar !== null) return;
+
+    // GPT-2 bytes_to_unicode mapping
     const bs = [
       ...Array.from({ length: 94 }, (_, i) => 33 + i),   // 33-126 (printable ASCII)
       ...Array.from({ length: 12 }, (_, i) => 161 + i),  // 161-172
@@ -291,12 +294,45 @@ export class Tokenizer {
       }
     }
 
-    const byteToChar = new Map<number, string>();
+    Tokenizer.gpt2ByteToChar = new Map<number, string>();
+    Tokenizer.gpt2CharToByte = new Map<string, number>();
+
     for (let i = 0; i < bs.length; i++) {
-      byteToChar.set(bs[i], String.fromCharCode(cs[i]));
+      const char = String.fromCharCode(cs[i]);
+      Tokenizer.gpt2ByteToChar.set(bs[i], char);
+      Tokenizer.gpt2CharToByte.set(char, bs[i]);
+    }
+  }
+
+  /**
+   * GPT-2 style byte-to-unicode mapping
+   * Maps bytes to unicode characters to avoid whitespace/control char issues
+   */
+  private byteToUnicode(byte: number): string {
+    Tokenizer.initGPT2Tables();
+    return Tokenizer.gpt2ByteToChar!.get(byte) || String.fromCharCode(byte);
+  }
+
+  /**
+   * Decode GPT-2 style unicode characters back to bytes
+   * Converts Ġ -> space, Ċ -> newline, etc.
+   */
+  private decodeGPT2Bytes(text: string): string {
+    Tokenizer.initGPT2Tables();
+
+    const result: number[] = [];
+    for (const char of text) {
+      const byte = Tokenizer.gpt2CharToByte!.get(char);
+      if (byte !== undefined) {
+        result.push(byte);
+      } else {
+        // Regular character, encode as UTF-8
+        const encoded = new TextEncoder().encode(char);
+        result.push(...encoded);
+      }
     }
 
-    return byteToChar.get(byte) || String.fromCharCode(byte);
+    return new TextDecoder().decode(new Uint8Array(result));
   }
 
   /**
@@ -360,13 +396,16 @@ export class Tokenizer {
 
     let text = pieces.join('');
 
-    // Handle special space encoding
+    // Handle SentencePiece space encoding (▁)
     text = text.replace(/▁/g, ' ');
 
-    // Handle byte tokens
+    // Handle <0xNN> byte tokens
     text = text.replace(/<0x([0-9A-Fa-f]{2})>/g, (_, hex) => {
       return String.fromCharCode(parseInt(hex, 16));
     });
+
+    // Handle GPT-2 byte-level encoding (Ġ -> space, Ċ -> newline, etc.)
+    text = this.decodeGPT2Bytes(text);
 
     return text;
   }
@@ -381,10 +420,17 @@ export class Tokenizer {
     }
 
     let text = piece;
+
+    // Handle SentencePiece space encoding (▁)
     text = text.replace(/▁/g, ' ');
+
+    // Handle <0xNN> byte tokens
     text = text.replace(/<0x([0-9A-Fa-f]{2})>/g, (_, hex) => {
       return String.fromCharCode(parseInt(hex, 16));
     });
+
+    // Handle GPT-2 byte-level encoding (Ġ -> space, Ċ -> newline, etc.)
+    text = this.decodeGPT2Bytes(text);
 
     return text;
   }
