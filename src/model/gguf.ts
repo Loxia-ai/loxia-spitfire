@@ -276,7 +276,10 @@ export async function parseGGUF(
     }
 
     // Current position is where tensor data starts
-    const tensorDataOffset = reader.getCurrentOffset();
+    // GGUF v3 requires tensor data to be aligned to 32 bytes
+    const rawOffset = reader.getCurrentOffset();
+    const alignment = 32n;
+    const tensorDataOffset = ((rawOffset + alignment - 1n) / alignment) * alignment;
 
     return {
       header,

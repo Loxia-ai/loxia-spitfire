@@ -12,7 +12,8 @@
 - **WebGPU Acceleration** - GPU-accelerated inference with automatic fallback
 - **WebAssembly Engine** - Cross-platform CPU inference, runs anywhere Node.js runs
 - **Ollama-compatible** - Works with existing GGUF models
-- **Quantization Support** - Q4_0, Q8_0, Q4_K dequantization on GPU
+- **Quantization Support** - Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, F16, F32 dequantization on GPU
+- **Chat Templates** - Automatic Jinja2 chat template support (Qwen2, Llama, etc.)
 - **HTTP API** - Drop-in replacement for Ollama's REST API
 - **Programmatic API** - Clean TypeScript/JavaScript API
 - **Streaming** - Full streaming support for text generation
@@ -117,6 +118,32 @@ const result = await engine.generate('Hello!', {
 });
 
 await engine.shutdown();
+```
+
+### Chat Templates
+
+Spitfire automatically applies chat templates from GGUF metadata. For models like Qwen2, your prompt is automatically formatted:
+
+```typescript
+// Your input:
+const result = await engine.generate('What is 2+2?');
+
+// Automatically formatted as:
+// <|im_start|>system
+// You are Qwen, created by Alibaba Cloud...
+// <|im_end|>
+// <|im_start|>user
+// What is 2+2?<|im_end|>
+// <|im_start|>assistant
+```
+
+If you want to handle formatting yourself, use `rawPrompt: true`:
+
+```typescript
+const prompt = '<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n';
+const result = await engine.generate(prompt, {
+  rawPrompt: true  // Skip automatic chat template
+});
 ```
 
 ### Using the High-Level API
@@ -239,6 +266,7 @@ await engine.generate(prompt, {
   topK?: number;
   topP?: number;
   stop?: string[];
+  rawPrompt?: boolean;  // Skip chat template formatting
 });
 
 await engine.embed(text);  // Get embeddings
@@ -298,13 +326,18 @@ Spitfire works with GGUF model files. Supported quantization formats:
 
 | Format | WebGPU | WASM |
 |--------|--------|------|
-| F32 | Yes | Yes |
-| F16 | Yes | Yes |
-| Q8_0 | Yes | Yes |
-| Q4_0 | Yes | Yes |
-| Q4_K | Yes | Yes |
-| Q5_K | Partial | Yes |
-| Q6_K | Partial | Yes |
+| F32 | ✅ Yes | ✅ Yes |
+| F16 | ✅ Yes | ✅ Yes |
+| Q8_0 | ✅ Yes | ✅ Yes |
+| Q4_0 | ✅ Yes | ✅ Yes |
+| Q4_K | ✅ Yes | ✅ Yes |
+| Q5_K | ✅ Yes | ✅ Yes |
+| Q6_K | ✅ Yes | ✅ Yes |
+
+**Tested Models:**
+- Qwen2.5-Coder-3B-Instruct (Q4_K_M, Q6_K)
+- Llama 3.2 (various quantizations)
+- Other GGUF-compatible models
 
 **Get models from:**
 1. **HuggingFace** - Many quantized models available

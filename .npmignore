@@ -17,8 +17,15 @@ jest.config.js
 .eslintrc.js
 .prettierrc
 
-# Documentation (keep README)
+# Documentation (keep README and CHANGELOG)
 WEBGPU_IMPLEMENTATION_PLAN.md
+
+# Test files
+test-*.mjs
+test-*.js
+test-*.txt
+*.test.ts
+*.spec.ts
 
 # Misc
 *.log
@@ -29,4 +36,4 @@ coverage/
 .nyc_output/
 node_modules/
 
-# Only include dist/, README.md, LICENSE, package.json
+# Only include dist/, README.md, CHANGELOG.md, LICENSE, package.json

@@ -34,7 +34,7 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
-var<workgroup> shared: array<f32, 256>;
+var<workgroup> wg_data: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -52,16 +52,16 @@ fn main(
   for (var i = localIdx; i < hiddenSize; i += WORKGROUP_SIZE) {
     localSum += input[baseIdx + i];
   }
-  shared[localIdx] = localSum;
+  wg_data[localIdx] = localSum;
   workgroupBarrier();
 
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] += shared[localIdx + s];
+      wg_data[localIdx] += wg_data[localIdx + s];
     }
     workgroupBarrier();
   }
-  let mean = shared[0] / f32(hiddenSize);
+  let mean = wg_data[0] / f32(hiddenSize);
   workgroupBarrier();
 
   // Step 2: Compute variance
@@ -70,16 +70,16 @@ fn main(
     let diff = input[baseIdx + i] - mean;
     localVar += diff * diff;
   }
-  shared[localIdx] = localVar;
+  wg_data[localIdx] = localVar;
   workgroupBarrier();
 
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] += shared[localIdx + s];
+      wg_data[localIdx] += wg_data[localIdx + s];
     }
     workgroupBarrier();
   }
-  let variance = shared[0] / f32(hiddenSize);
+  let variance = wg_data[0] / f32(hiddenSize);
   let rstd = inverseSqrt(variance + params.eps);
   workgroupBarrier();
 
@@ -105,7 +105,7 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
-var<workgroup> shared: array<f32, 256>;
+var<workgroup> wg_data: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -124,16 +124,16 @@ fn main(
     let val = input[baseIdx + i];
     localSumSq += val * val;
   }
-  shared[localIdx] = localSumSq;
+  wg_data[localIdx] = localSumSq;
   workgroupBarrier();
 
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] += shared[localIdx + s];
+      wg_data[localIdx] += wg_data[localIdx + s];
     }
     workgroupBarrier();
   }
-  let rms = sqrt(shared[0] / f32(hiddenSize) + params.eps);
+  let rms = sqrt(wg_data[0] / f32(hiddenSize) + params.eps);
   let scale = 1.0 / rms;
   workgroupBarrier();
 
@@ -273,21 +273,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let d = remainder % halfDim;
 
   // Compute rotation angle
+  // theta = pos * inv_freq[d] where inv_freq[d] = 1 / base^(2d/headDim)
   let theta = f32(pos) / pow(base, 2.0 * f32(d) / f32(headDim));
   let cosTheta = cos(theta);
   let sinTheta = sin(theta);
 
-  // Input indices
+  // Input indices - SPLIT HALVES pattern (used by Qwen2/LLaMA-style)
+  // x1 = first half (dims 0..halfDim-1)
+  // x2 = second half (dims halfDim..headDim-1)
+  // Pairs are (0,64), (1,65), (2,66), ... for headDim=128
   let baseIdx = (pos * numHeads + head) * headDim;
-  let idx1 = baseIdx + d;
-  let idx2 = baseIdx + d + halfDim;
+  let idx1 = baseIdx + d;           // First half: 0, 1, 2, ... 63
+  let idx2 = baseIdx + d + halfDim; // Second half: 64, 65, 66, ... 127
 
   let x1 = input[idx1];
   let x2 = input[idx2];
 
-  // Apply rotation
+  // Apply rotation using rotate_half pattern:
+  // output[d] = x1 * cos - x2 * sin
+  // output[d + halfDim] = x2 * cos + x1 * sin
   output[idx1] = x1 * cosTheta - x2 * sinTheta;
-  output[idx2] = x1 * sinTheta + x2 * cosTheta;
+  output[idx2] = x2 * cosTheta + x1 * sinTheta;
 }
 `;
 
@@ -493,4 +499,13 @@ export async function mlp(
   activated.destroy();
 
   return output;
+}
+
+/**
+ * Reset all cached pipelines (useful after shader updates)
+ */
+export function resetLayersPipelines(): void {
+  layerNormPipeline = null;
+  rmsNormPipeline = null;
+  ropePipeline = null;
 }

@@ -48,6 +48,23 @@ export function createShaderModule(
     code: source,
   });
 
+  // Check for compilation errors asynchronously
+  module.getCompilationInfo().then((info) => {
+    for (const message of info.messages) {
+      const type = message.type;
+      const text = message.message;
+      const line = message.lineNum;
+      const col = message.linePos;
+      if (type === 'error') {
+        console.error(`WGSL Error in "${label || 'shader'}" at line ${line}:${col}: ${text}`);
+      } else if (type === 'warning') {
+        console.warn(`WGSL Warning in "${label || 'shader'}" at line ${line}:${col}: ${text}`);
+      }
+    }
+  }).catch(() => {
+    // Ignore if getCompilationInfo not supported
+  });
+
   shaderCache.set(cacheKey, module);
   return module;
 }

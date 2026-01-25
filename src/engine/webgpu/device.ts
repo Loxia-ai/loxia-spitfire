@@ -127,9 +127,13 @@ export class WebGPUDevice {
     const adapterInfo = this.adapter.info;
 
     // Request device with required features and limits
+    // Request the maximum buffer size the adapter supports (up to 2GB)
+    const adapterMaxBuffer = Number(this.adapter.limits.maxBufferSize) || 2 * 1024 * 1024 * 1024;
+    const adapterMaxStorage = Number(this.adapter.limits.maxStorageBufferBindingSize) || 2 * 1024 * 1024 * 1024;
+
     const requiredLimits: Record<string, number> = {
-      maxStorageBufferBindingSize: 1024 * 1024 * 1024, // 1GB
-      maxBufferSize: 1024 * 1024 * 1024, // 1GB
+      maxStorageBufferBindingSize: Math.min(adapterMaxStorage, 2 * 1024 * 1024 * 1024), // Up to 2GB
+      maxBufferSize: Math.min(adapterMaxBuffer, 2 * 1024 * 1024 * 1024), // Up to 2GB
       ...options.requiredLimits,
     };
 

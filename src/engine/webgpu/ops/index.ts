@@ -15,6 +15,7 @@ import {
 } from '../shader.js';
 import {
   createStorageBuffer,
+  createStorageBufferWithData,
   createUniformBufferWithData,
 } from '../buffer.js';
 
@@ -430,7 +431,7 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
-var<workgroup> shared: array<f32, 256>;
+var<workgroup> wg_data: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn sum_kernel(
@@ -443,23 +444,23 @@ fn sum_kernel(
 
   // Load to shared memory
   if (idx < params.size) {
-    shared[localIdx] = input[idx];
+    wg_data[localIdx] = input[idx];
   } else {
-    shared[localIdx] = 0.0;
+    wg_data[localIdx] = 0.0;
   }
   workgroupBarrier();
 
   // Parallel reduction
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] += shared[localIdx + s];
+      wg_data[localIdx] += wg_data[localIdx + s];
     }
     workgroupBarrier();
   }
 
   // Write result
   if (localIdx == 0u) {
-    output[wid.x] = shared[0];
+    output[wid.x] = wg_data[0];
   }
 }
 
@@ -474,23 +475,23 @@ fn max_kernel(
 
   // Load to shared memory
   if (idx < params.size) {
-    shared[localIdx] = input[idx];
+    wg_data[localIdx] = input[idx];
   } else {
-    shared[localIdx] = -3.4028235e+38; // -FLT_MAX
+    wg_data[localIdx] = -1.0e+38; // -FLT_MAX
   }
   workgroupBarrier();
 
   // Parallel reduction
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] = max(shared[localIdx], shared[localIdx + s]);
+      wg_data[localIdx] = max(wg_data[localIdx], wg_data[localIdx + s]);
     }
     workgroupBarrier();
   }
 
   // Write result
   if (localIdx == 0u) {
-    output[wid.x] = shared[0];
+    output[wid.x] = wg_data[0];
   }
 }
 `;
@@ -582,7 +583,7 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
-var<workgroup> shared: array<f32, 256>;
+var<workgroup> wg_data: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn softmax_kernel(
@@ -596,21 +597,21 @@ fn softmax_kernel(
   let baseIdx = batchIdx * innerSize;
 
   // Step 1: Find max (for numerical stability)
-  var localMax: f32 = -3.4028235e+38;
+  var localMax: f32 = -1.0e+38;
   for (var i = localIdx; i < innerSize; i += WORKGROUP_SIZE) {
     localMax = max(localMax, input[baseIdx + i]);
   }
-  shared[localIdx] = localMax;
+  wg_data[localIdx] = localMax;
   workgroupBarrier();
 
   // Reduce to find global max
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] = max(shared[localIdx], shared[localIdx + s]);
+      wg_data[localIdx] = max(wg_data[localIdx], wg_data[localIdx + s]);
     }
     workgroupBarrier();
   }
-  let maxVal = shared[0];
+  let maxVal = wg_data[0];
   workgroupBarrier();
 
   // Step 2: Compute exp(x - max) and sum
@@ -620,17 +621,17 @@ fn softmax_kernel(
     output[baseIdx + i] = expVal;
     localSum += expVal;
   }
-  shared[localIdx] = localSum;
+  wg_data[localIdx] = localSum;
   workgroupBarrier();
 
   // Reduce to find total sum
   for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
     if (localIdx < s) {
-      shared[localIdx] += shared[localIdx + s];
+      wg_data[localIdx] += wg_data[localIdx + s];
     }
     workgroupBarrier();
   }
-  let sumVal = shared[0];
+  let sumVal = wg_data[0];
   workgroupBarrier();
 
   // Step 3: Normalize
@@ -669,6 +670,254 @@ export async function softmax(x: Tensor): Promise<Tensor> {
   ]);
 
   await executeCompute(softmaxPipeline, [bindGroup], [batchSize, 1, 1]);
+
+  params.destroy();
+  return output;
+}
+
+/**
+ * Reset all cached pipelines (useful after shader updates)
+ */
+export function resetOpsPipelines(): void {
+  elementwisePipelines = null;
+  binaryPipelines = null;
+  scalarPipelines = null;
+  matmulPipeline = null;
+  reducePipelines = null;
+  softmaxPipeline = null;
+  embeddingPipeline = null;
+}
+
+// ============================================================================
+// Embedding Lookup
+// ============================================================================
+
+const EMBEDDING_SHADER = `
+struct Params {
+  seqLen: u32,
+  hiddenSize: u32,
+  vocabSize: u32,
+  transposed: u32,  // 1 if embeddings are [hiddenSize, vocabSize], 0 if [vocabSize, hiddenSize]
+}
+
+@group(0) @binding(0) var<storage, read> embeddings: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let seqLen = params.seqLen;
+  let hiddenSize = params.hiddenSize;
+  let vocabSize = params.vocabSize;
+
+  // Each thread handles one element in the output
+  let totalElements = seqLen * hiddenSize;
+  if (idx >= totalElements) {
+    return;
+  }
+
+  // Determine which token and which hidden dimension
+  let tokenIdx = idx / hiddenSize;
+  let dimIdx = idx % hiddenSize;
+
+  // Get the token ID for this position
+  let tokenId = indices[tokenIdx];
+
+  // Look up the embedding based on storage format
+  var embeddingIdx: u32;
+  if (params.transposed == 1u) {
+    // Embeddings stored as [hiddenSize, vocabSize]
+    // To get embedding for token t, we need column t: element at [d, t] = d * vocabSize + t
+    embeddingIdx = dimIdx * vocabSize + tokenId;
+  } else {
+    // Embeddings stored as [vocabSize, hiddenSize]
+    // To get embedding for token t, we need row t: element at [t, d] = t * hiddenSize + d
+    embeddingIdx = tokenId * hiddenSize + dimIdx;
+  }
+  output[idx] = embeddings[embeddingIdx];
+}
+`;
+
+let embeddingPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Embedding lookup: maps token indices to embedding vectors
+ * embeddings: [vocabSize, hiddenSize] or [hiddenSize, vocabSize] (GGUF format)
+ * indices: [seqLen] (token IDs)
+ * vocabSize: optional, helps detect transposed format
+ * returns: [seqLen, hiddenSize]
+ */
+export async function embeddingLookup(
+  embeddings: Tensor,
+  indices: number[],
+  vocabSizeHint?: number
+): Promise<Tensor> {
+  if (embeddings.ndim !== 2) {
+    throw new Error('Embeddings must be 2D');
+  }
+
+  if (!embeddingPipeline) {
+    embeddingPipeline = createComputePipelineFromSource(EMBEDDING_SHADER, {
+      label: 'embedding',
+      entryPoint: 'main',
+    });
+  }
+
+  const [dim0, dim1] = embeddings.shape;
+  const seqLen = indices.length;
+
+  // Detect if embeddings are transposed (GGUF stores as [hiddenSize, vocabSize])
+  // If vocabSizeHint is provided, use it to detect; otherwise assume larger dim is vocabSize
+  let vocabSize: number;
+  let hiddenSize: number;
+  let transposed: number;
+
+  if (vocabSizeHint !== undefined) {
+    // Use hint to determine format
+    if (dim0 === vocabSizeHint) {
+      // Standard format [vocabSize, hiddenSize]
+      vocabSize = dim0;
+      hiddenSize = dim1;
+      transposed = 0;
+    } else if (dim1 === vocabSizeHint) {
+      // Transposed format [hiddenSize, vocabSize]
+      hiddenSize = dim0;
+      vocabSize = dim1;
+      transposed = 1;
+    } else {
+      throw new Error(`Embedding shape [${dim0}, ${dim1}] doesn't match vocabSize ${vocabSizeHint}`);
+    }
+  } else {
+    // Assume larger dimension is vocabSize
+    if (dim0 > dim1) {
+      vocabSize = dim0;
+      hiddenSize = dim1;
+      transposed = 0;
+    } else {
+      hiddenSize = dim0;
+      vocabSize = dim1;
+      transposed = 1;
+    }
+  }
+
+  // Create indices buffer
+  const indicesBuffer = createStorageBufferWithData(
+    new Uint32Array(indices),
+    'embedding_indices'
+  );
+
+  const output = Tensor.empty([seqLen, hiddenSize], { label: 'embedding_output' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([seqLen, hiddenSize, vocabSize, transposed]),
+    'embedding_params'
+  );
+
+  // Debug: print embedding lookup params
+  if (seqLen <= 82) {
+    console.log(`[EmbLookup] shape=[${dim0}, ${dim1}], vocabSize=${vocabSize}, hiddenSize=${hiddenSize}, transposed=${transposed}`);
+    console.log(`[EmbLookup] First 5 token IDs: [${indices.slice(0, 5).join(', ')}]`);
+    console.log(`[EmbLookup] Token 0 (${indices[0]}) index range: ${indices[0] * hiddenSize} to ${indices[0] * hiddenSize + hiddenSize - 1}`);
+  }
+
+  const bindGroup = createBindGroup(embeddingPipeline, 0, [
+    { binding: 0, resource: embeddings.getBuffer() },
+    { binding: 1, resource: indicesBuffer },
+    { binding: 2, resource: output.getBuffer() },
+    { binding: 3, resource: params },
+  ]);
+
+  const totalElements = seqLen * hiddenSize;
+  const workgroups = calculateWorkgroups(totalElements, 256);
+  await executeCompute(embeddingPipeline, [bindGroup], [workgroups, 1, 1]);
+
+  // Debug: verify the output by reading back
+  if (seqLen <= 82) {
+    const outData = await output.toArray();
+    console.log(`[EmbLookup] Output first 8: [${Array.from(outData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+    // Also verify by reading embedding directly
+    const embData = await embeddings.toArray();
+    const tokenId = indices[0];
+    const directLookup = embData.slice(tokenId * hiddenSize, tokenId * hiddenSize + 8);
+    console.log(`[EmbLookup] Direct lookup token ${tokenId} first 8: [${Array.from(directLookup).map(v => v.toFixed(4)).join(', ')}]`);
+  }
+
+  params.destroy();
+  indicesBuffer.destroy();
+
+  return output;
+}
+
+// ============================================================================
+// Transpose
+// ============================================================================
+
+const TRANSPOSE_SHADER = `
+struct Params {
+  rows: u32,
+  cols: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.y;
+  let col = gid.x;
+  let rows = params.rows;
+  let cols = params.cols;
+
+  if (row >= rows || col >= cols) {
+    return;
+  }
+
+  // input[row, col] -> output[col, row]
+  let inIdx = row * cols + col;
+  let outIdx = col * rows + row;
+  output[outIdx] = input[inIdx];
+}
+`;
+
+let transposePipeline: GPUComputePipeline | null = null;
+
+/**
+ * Transpose a 2D tensor
+ * input: [rows, cols] -> output: [cols, rows]
+ */
+export async function transpose(input: Tensor): Promise<Tensor> {
+  if (input.ndim !== 2) {
+    throw new Error('transpose requires 2D tensor');
+  }
+
+  if (!transposePipeline) {
+    transposePipeline = createComputePipelineFromSource(TRANSPOSE_SHADER, {
+      label: 'transpose',
+      entryPoint: 'main',
+    });
+  }
+
+  const [rows, cols] = input.shape;
+  const output = Tensor.empty([cols, rows], { label: 'transpose_output' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([rows, cols, 0, 0]),
+    'transpose_params'
+  );
+
+  const bindGroup = createBindGroup(transposePipeline, 0, [
+    { binding: 0, resource: input.getBuffer() },
+    { binding: 1, resource: output.getBuffer() },
+    { binding: 2, resource: params },
+  ]);
+
+  const [wgX, wgY] = calculateWorkgroups2D(cols, rows, 16, 16);
+  await executeCompute(transposePipeline, [bindGroup], [wgX, wgY, 1]);
 
   params.destroy();
   return output;

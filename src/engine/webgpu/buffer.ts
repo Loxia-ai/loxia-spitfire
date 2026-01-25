@@ -7,6 +7,27 @@
 
 import { getWebGPUDevice } from './device.js';
 
+// Define GPUBufferUsage constants for Node.js compatibility
+// These are the standard WebGPU buffer usage flags
+const GPUBufferUsageFlags = {
+  MAP_READ: 0x0001,
+  MAP_WRITE: 0x0002,
+  COPY_SRC: 0x0004,
+  COPY_DST: 0x0008,
+  INDEX: 0x0010,
+  VERTEX: 0x0020,
+  UNIFORM: 0x0040,
+  STORAGE: 0x0080,
+  INDIRECT: 0x0100,
+  QUERY_RESOLVE: 0x0200,
+} as const;
+
+// Define GPUMapMode constants for Node.js compatibility
+const GPUMapModeFlags = {
+  READ: 0x0001,
+  WRITE: 0x0002,
+} as const;
+
 export type BufferUsage = 'storage' | 'uniform' | 'vertex' | 'index' | 'copy-src' | 'copy-dst';
 
 export interface BufferOptions {
@@ -23,22 +44,22 @@ function usageToFlags(usage: BufferUsage[]): GPUBufferUsageFlags {
   for (const u of usage) {
     switch (u) {
       case 'storage':
-        flags |= GPUBufferUsage.STORAGE;
+        flags |= GPUBufferUsageFlags.STORAGE;
         break;
       case 'uniform':
-        flags |= GPUBufferUsage.UNIFORM;
+        flags |= GPUBufferUsageFlags.UNIFORM;
         break;
       case 'vertex':
-        flags |= GPUBufferUsage.VERTEX;
+        flags |= GPUBufferUsageFlags.VERTEX;
         break;
       case 'index':
-        flags |= GPUBufferUsage.INDEX;
+        flags |= GPUBufferUsageFlags.INDEX;
         break;
       case 'copy-src':
-        flags |= GPUBufferUsage.COPY_SRC;
+        flags |= GPUBufferUsageFlags.COPY_SRC;
         break;
       case 'copy-dst':
-        flags |= GPUBufferUsage.COPY_DST;
+        flags |= GPUBufferUsageFlags.COPY_DST;
         break;
     }
   }
@@ -156,7 +177,7 @@ export function createStagingBuffer(size: number, label?: string): GPUBuffer {
   return device.createBuffer({
     label,
     size: alignedSize,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsageFlags.MAP_READ | GPUBufferUsageFlags.COPY_DST,
   });
 }
 
@@ -196,7 +217,7 @@ export async function readBuffer(
   await device.queue.onSubmittedWorkDone();
 
   // Map and read
-  await stagingBuffer.mapAsync(GPUMapMode.READ);
+  await stagingBuffer.mapAsync(GPUMapModeFlags.READ);
   const data = stagingBuffer.getMappedRange().slice(0);
   stagingBuffer.unmap();
   stagingBuffer.destroy();
