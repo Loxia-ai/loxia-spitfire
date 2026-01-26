@@ -44,6 +44,12 @@ export {
   generateElementwiseShader,
   generateBinaryShader,
   WGSL_UTILS,
+  getCommandBatcher,
+  flushCommandBatcher,
+  flushAndSyncCommandBatcher,
+  getCommandBatcherStats,
+  resetCommandBatcherStats,
+  requestBufferDestroy,
   type ComputePipelineOptions,
   type BindGroupEntry,
 } from './shader.js';

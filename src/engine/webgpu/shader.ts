@@ -29,6 +29,168 @@ const shaderCache = new Map<string, GPUShaderModule>();
 const pipelineCache = new Map<string, GPUComputePipeline>();
 
 /**
+ * Command Batcher for reducing WebGPU/Dawn overhead
+ * Batches multiple command buffers and submits them together in a single queue.submit() call
+ * Based on TensorFlow.js research: batching ~15 command buffers provides 5%+ improvement
+ *
+ * Key insight from TensorFlow.js: track buffers owned by pending commands and defer their
+ * destruction until after submit. Destroying a buffer while it's in use causes commands to fail.
+ */
+class CommandBatcher {
+  private pendingCommandBuffers: GPUCommandBuffer[] = [];
+  private readonly BATCH_SIZE = 15; // TensorFlow.js empirical value
+  private totalBatches = 0;
+  private totalPasses = 0;
+
+  // Buffers that were requested to be destroyed while commands are pending
+  private pendingDisposal: GPUBuffer[] = [];
+
+  /**
+   * Add a command buffer to the pending batch
+   * Note: usedBuffers parameter kept for API compatibility but no longer tracked individually
+   */
+  addCommandBuffer(commandBuffer: GPUCommandBuffer, _usedBuffers: GPUBuffer[]): void {
+    this.pendingCommandBuffers.push(commandBuffer);
+    this.totalPasses++;
+
+    // Auto-flush when batch is full
+    if (this.pendingCommandBuffers.length >= this.BATCH_SIZE) {
+      this.flush();
+    }
+  }
+
+  /**
+   * Request buffer destruction - defers if there are pending commands
+   * Simplified: if ANY commands are pending, defer ALL destructions
+   * Returns true if destruction was deferred, false if destroyed immediately
+   */
+  requestDestroy(buffer: GPUBuffer): boolean {
+    if (this.pendingCommandBuffers.length > 0) {
+      // Commands are pending - defer destruction
+      this.pendingDisposal.push(buffer);
+      return true;
+    }
+    // No pending commands - can destroy immediately
+    return false;
+  }
+
+  /**
+   * Flush all pending command buffers to the GPU
+   */
+  flush(): void {
+    if (this.pendingCommandBuffers.length > 0) {
+      const gpuDevice = getWebGPUDevice();
+      // Submit all command buffers in a single call - this is the key optimization
+      gpuDevice.submit(this.pendingCommandBuffers);
+      this.totalBatches++;
+      this.pendingCommandBuffers = [];
+    }
+
+    // Destroy buffers that were deferred
+    for (const buffer of this.pendingDisposal) {
+      buffer.destroy();
+    }
+    this.pendingDisposal = [];
+  }
+
+  /**
+   * Flush and wait for GPU to complete all work
+   */
+  async flushAndSync(): Promise<void> {
+    this.flush();
+    await getWebGPUDevice().sync();
+  }
+
+  /**
+   * Get statistics about batching
+   */
+  getStats(): { totalBatches: number; totalPasses: number; avgPassesPerBatch: number } {
+    return {
+      totalBatches: this.totalBatches,
+      totalPasses: this.totalPasses,
+      avgPassesPerBatch: this.totalBatches > 0 ? this.totalPasses / this.totalBatches : 0,
+    };
+  }
+
+  /**
+   * Reset statistics
+   */
+  resetStats(): void {
+    this.totalBatches = 0;
+    this.totalPasses = 0;
+  }
+
+  /**
+   * Check if there are pending command buffers
+   */
+  hasPending(): boolean {
+    return this.pendingCommandBuffers.length > 0;
+  }
+}
+
+/**
+ * Global command batcher instance
+ */
+let commandBatcher: CommandBatcher | null = null;
+
+/**
+ * Get the global command batcher (creates if needed)
+ */
+export function getCommandBatcher(): CommandBatcher {
+  if (!commandBatcher) {
+    commandBatcher = new CommandBatcher();
+  }
+  return commandBatcher;
+}
+
+/**
+ * Flush the global command batcher
+ */
+export function flushCommandBatcher(): void {
+  if (commandBatcher) {
+    commandBatcher.flush();
+  }
+}
+
+/**
+ * Flush the global command batcher and sync with GPU
+ */
+export async function flushAndSyncCommandBatcher(): Promise<void> {
+  if (commandBatcher) {
+    await commandBatcher.flushAndSync();
+  }
+}
+
+/**
+ * Get command batcher statistics
+ */
+export function getCommandBatcherStats(): { totalBatches: number; totalPasses: number; avgPassesPerBatch: number } | null {
+  return commandBatcher ? commandBatcher.getStats() : null;
+}
+
+/**
+ * Reset command batcher statistics
+ */
+export function resetCommandBatcherStats(): void {
+  if (commandBatcher) {
+    commandBatcher.resetStats();
+  }
+}
+
+/**
+ * Request buffer destruction - defers if buffer is owned by pending commands
+ * Based on TensorFlow.js approach: track owned buffers and defer disposal
+ */
+export function requestBufferDestroy(buffer: GPUBuffer): void {
+  const batcher = getCommandBatcher();
+  if (!batcher.requestDestroy(buffer)) {
+    // Buffer not owned by pending commands - destroy immediately
+    buffer.destroy();
+  }
+  // If owned, destruction is deferred until after flush
+}
+
+/**
  * Create a shader module from WGSL source
  */
 export function createShaderModule(
@@ -174,23 +336,36 @@ export function dispatchCompute(
 
 /**
  * Execute a compute shader
- * By default, submits without waiting (async GPU execution)
+ * By default, uses command buffer batching to reduce queue.submit() overhead
+ * Command buffers are batched and submitted together (TensorFlow.js approach)
  * Set sync=true only when you need to read results immediately
+ * Set batched=false to submit immediately (legacy behavior)
+ *
+ * @param usedBuffers - Array of GPUBuffers used by this operation (for tracking disposal)
  */
 export async function executeCompute(
   pipeline: GPUComputePipeline,
   bindGroups: GPUBindGroup[],
   workgroupCounts: [number, number, number],
   label?: string,
-  sync = false
+  sync = false,
+  batched = true,
+  usedBuffers: GPUBuffer[] = []
 ): Promise<void> {
-  const gpuDevice = getWebGPUDevice();
+  // Create the command buffer (same as before)
   const commandBuffer = dispatchCompute(pipeline, bindGroups, workgroupCounts, label);
-  gpuDevice.submit([commandBuffer]);
-  // Only sync when explicitly requested (e.g., before reading buffer)
-  // GPU commands are still executed in order, just not waited on
-  if (sync) {
-    await gpuDevice.sync();
+
+  if (batched && !sync) {
+    // Add to batch with buffer tracking
+    getCommandBatcher().addCommandBuffer(commandBuffer, usedBuffers);
+  } else {
+    // Direct execution - submit immediately
+    const gpuDevice = getWebGPUDevice();
+    gpuDevice.submit([commandBuffer]);
+    // Only sync when explicitly requested (e.g., before reading buffer)
+    if (sync) {
+      await gpuDevice.sync();
+    }
   }
 }
 

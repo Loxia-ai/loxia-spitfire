@@ -11,6 +11,7 @@ import {
   createBindGroup,
   executeCompute,
   calculateWorkgroups,
+  requestBufferDestroy,
 } from '../shader.js';
 import {
   createStorageBuffer,
@@ -278,10 +279,11 @@ export async function dequantizeQ4_0(
   ]);
 
   const workgroups = calculateWorkgroups(numBlocks, 256);
-  await executeCompute(q4_0Pipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [inputBuffer, outputBuffer, params];
+  await executeCompute(q4_0Pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  inputBuffer.destroy();
-  params.destroy();
+  requestBufferDestroy(inputBuffer);
+  requestBufferDestroy(params);
 
   // Determine output shape (1D for now)
   return new Tensor([numElements], outputBuffer, { label: 'dequantized_q4_0' });
@@ -322,10 +324,11 @@ export async function dequantizeQ8_0(
   ]);
 
   const workgroups = calculateWorkgroups(numBlocks, 256);
-  await executeCompute(q8_0Pipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [inputBuffer, outputBuffer, params];
+  await executeCompute(q8_0Pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  inputBuffer.destroy();
-  params.destroy();
+  requestBufferDestroy(inputBuffer);
+  requestBufferDestroy(params);
 
   return new Tensor([numElements], outputBuffer, { label: 'dequantized_q8_0' });
 }

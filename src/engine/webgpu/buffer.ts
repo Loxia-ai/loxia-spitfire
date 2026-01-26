@@ -6,6 +6,7 @@
 /// <reference types="@webgpu/types" />
 
 import { getWebGPUDevice } from './device.js';
+import { flushCommandBatcher } from './shader.js';
 
 // Define GPUBufferUsage constants for Node.js compatibility
 // These are the standard WebGPU buffer usage flags
@@ -200,6 +201,9 @@ export async function readBuffer(
   buffer: GPUBuffer,
   size?: number
 ): Promise<ArrayBuffer> {
+  // Flush any pending batched commands before reading
+  flushCommandBatcher();
+
   const gpuDevice = getWebGPUDevice();
   const device = gpuDevice.getDevice();
 

@@ -11,9 +11,10 @@ import {
   createBindGroup,
   executeCompute,
   calculateWorkgroups,
+  requestBufferDestroy,
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
-import { matmul, mul, softmax, mulScalar } from '../ops/index.js';
+import { matmul, softmax, mulScalar } from '../ops/index.js';
 
 // ============================================================================
 // Layer Normalization
@@ -186,9 +187,10 @@ export async function layerNorm(
     { binding: 4, resource: params },
   ]);
 
-  await executeCompute(layerNormPipeline, [bindGroup], [batchSize, 1, 1]);
+  const usedBuffers = [input.getBuffer(), weight.getBuffer(), bias.getBuffer(), output.getBuffer(), params];
+  await executeCompute(layerNormPipeline, [bindGroup], [batchSize, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -229,9 +231,10 @@ export async function rmsNorm(
     { binding: 3, resource: params },
   ]);
 
-  await executeCompute(rmsNormPipeline, [bindGroup], [batchSize, 1, 1]);
+  const usedBuffers = [input.getBuffer(), weight.getBuffer(), output.getBuffer(), params];
+  await executeCompute(rmsNormPipeline, [bindGroup], [batchSize, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -351,9 +354,10 @@ export async function applyRope(
 
   const totalPairs = seqLen * numHeads * (headDim / 2);
   const workgroups = calculateWorkgroups(totalPairs, 64);
-  await executeCompute(ropePipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(ropePipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -475,20 +479,10 @@ export async function feedForward(
   wUp: Tensor,
   wDown: Tensor
 ): Promise<Tensor> {
-  const { silu } = await import('../ops/index.js');
+  const { fusedSwiGLU } = await import('../ops/index.js');
 
-  // Gate projection
-  const gate = await matmul(x, wGate);
-  const gateAct = await silu(gate);
-  gate.destroy();
-
-  // Up projection
-  const up = await matmul(x, wUp);
-
-  // Element-wise multiply
-  const hidden = await mul(gateAct, up);
-  gateAct.destroy();
-  up.destroy();
+  // Fused SwiGLU: silu(x @ wGate) * (x @ wUp) in single kernel
+  const hidden = await fusedSwiGLU(x, wGate, wUp);
 
   // Down projection
   const output = await matmul(hidden, wDown);

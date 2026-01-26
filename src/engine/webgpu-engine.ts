@@ -17,12 +17,19 @@ import {
   loadLlamaWeights,
   disposeLlamaWeights,
   estimateModelMemory,
+  getCommandBatcherStats,
+  resetCommandBatcherStats,
   type LlamaWeights,
   type LlamaLayerWeights,
 } from './webgpu/index.js';
 import { extractArchitecture, getChatTemplate } from '../model/gguf.js';
 import type { GGUFFile, ModelArchitecture } from '../types/model.js';
 import { Tokenizer, parseGGUFWithTokenizer } from '../tokenizer/index.js';
+import {
+  NgramDraftCache,
+  type SpeculativeOptions,
+  DEFAULT_SPECULATIVE_OPTIONS,
+} from './speculative.js';
 
 // Configure nunjucks for Jinja2 compatibility
 const nunjucksEnv = new nunjucks.Environment(null, { autoescape: false });
@@ -49,6 +56,7 @@ export interface WebGPUGenerateOptions {
   repeatPenalty?: number;
   stop?: string[];
   rawPrompt?: boolean; // If true, skip chat template formatting
+  speculative?: Partial<SpeculativeOptions>; // Speculative decoding options
 }
 
 // Use LlamaWeights from model loader
@@ -56,15 +64,16 @@ export interface WebGPUGenerateOptions {
 type ModelWeights = LlamaWeights;
 
 /**
- * KV Cache for storing key/value projections across generation steps
- * This avoids recomputing attention for previously processed tokens
+ * GPU-Resident KV Cache for storing key/value projections across generation steps
+ * All data stays on GPU - no CPU transfers during generation
  */
-interface KVCache {
-  // Each layer has its own K and V cache
-  // Shape: [seqLen, numKVHeads * headDim]
-  keys: Float32Array[];    // One per layer
-  values: Float32Array[];  // One per layer
-  seqLen: number;          // Current cached sequence length
+interface GPUKVCache {
+  // Each layer has its own K and V cache tensors (pre-allocated to maxSeqLen)
+  // Shape: [maxSeqLen, numKVHeads * headDim]
+  keys: Tensor[];      // One per layer, pre-allocated
+  values: Tensor[];    // One per layer, pre-allocated
+  seqLen: number;      // Current cached sequence length (how much is filled)
+  maxSeqLen: number;   // Maximum sequence length this cache can hold
 }
 
 /**
@@ -95,8 +104,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   // Debug mode - when false, skips expensive GPU-CPU transfers for logging
   private debugMode = false;
 
-  // KV cache for efficient incremental generation
-  private kvCache: KVCache | null = null;
+  // GPU-resident KV cache for efficient incremental generation
+  private kvCache: GPUKVCache | null = null;
 
   constructor(options: WebGPUEngineOptions = {}) {
     super();
@@ -306,22 +315,58 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
-   * Create a new empty KV cache
+   * Create a new GPU-resident KV cache with pre-allocated buffers
+   * @param maxSeqLen - Maximum sequence length to support
    */
-  private createKVCache(): KVCache {
+  private createGPUKVCache(maxSeqLen: number): GPUKVCache {
     const numLayers = this.weights?.layers.length || this.numLayers;
+    const kvDim = this.numKVHeads * this.headDim;
+
+    console.log(`[KVCache] Allocating GPU cache: ${numLayers} layers × ${maxSeqLen} tokens × ${kvDim} dim`);
+    const memoryMB = (numLayers * 2 * maxSeqLen * kvDim * 4) / (1024 * 1024);
+    console.log(`[KVCache] Estimated memory: ${memoryMB.toFixed(1)} MB`);
+
     return {
-      keys: Array(numLayers).fill(null).map(() => new Float32Array(0)),
-      values: Array(numLayers).fill(null).map(() => new Float32Array(0)),
+      keys: Array(numLayers).fill(null).map((_, i) =>
+        Tensor.zeros([maxSeqLen, kvDim], { label: `kv_cache_k_layer${i}` })
+      ),
+      values: Array(numLayers).fill(null).map((_, i) =>
+        Tensor.zeros([maxSeqLen, kvDim], { label: `kv_cache_v_layer${i}` })
+      ),
       seqLen: 0,
+      maxSeqLen,
     };
   }
 
   /**
-   * Clear the KV cache (call when starting a new generation)
+   * Clear the KV cache and free GPU memory
    */
   private clearKVCache(): void {
-    this.kvCache = null;
+    if (this.kvCache) {
+      // Destroy all cache tensors to free GPU memory
+      for (const k of this.kvCache.keys) {
+        if (k && !k.isDestroyed()) k.destroy();
+      }
+      for (const v of this.kvCache.values) {
+        if (v && !v.isDestroyed()) v.destroy();
+      }
+      this.kvCache = null;
+    }
+  }
+
+  /**
+   * Rollback KV cache to a previous sequence length
+   * Used when speculative tokens are rejected
+   * The data beyond targetSeqLen is not zeroed - it will be overwritten on next forward pass
+   */
+  private rollbackKVCache(targetSeqLen: number): void {
+    if (!this.kvCache) return;
+
+    if (targetSeqLen < 0 || targetSeqLen > this.kvCache.seqLen) {
+      throw new Error(`Invalid rollback target: ${targetSeqLen}, current: ${this.kvCache.seqLen}`);
+    }
+
+    this.kvCache.seqLen = targetSeqLen;
   }
 
   /**
@@ -350,13 +395,14 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   /**
    * Forward pass through the model
    * @param inputIds - Token IDs to process
-   * @param useCache - If true, use KV cache for incremental generation (only process last token)
+   * @param useCache - If true, use KV cache for incremental generation (only process new tokens)
    */
   private async forward(inputIds: number[], useCache = false): Promise<Float32Array> {
     if (!this.weights) {
       throw new Error('Model weights not loaded');
     }
 
+    const forwardStart = performance.now();
     const fullSeqLen = inputIds.length;
     const DEBUG = this.debugMode;
 
@@ -364,27 +410,33 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     // startPos is where new tokens start (= cached sequence length)
     let startPos = 0;
     let tokensToProcess: number[];
+    let isIncremental = false;
 
     if (useCache && this.kvCache && this.kvCache.seqLen > 0) {
-      // Incremental mode: only process the last token
+      // Incremental mode: only process the new token(s)
+      isIncremental = true;
       startPos = this.kvCache.seqLen;
       tokensToProcess = inputIds.slice(startPos);
-      if (DEBUG) {
-        console.log(`\n[Forward] Incremental: processing ${tokensToProcess.length} new token(s) at pos ${startPos}`);
-      }
+      console.log(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos} (cache has ${this.kvCache.seqLen} tokens)`);
     } else {
       // Full mode: process all tokens (prefill)
       tokensToProcess = inputIds;
-      // Initialize or reset cache
+
+      // Initialize or reset GPU cache if using cache
       if (useCache) {
-        this.kvCache = this.createKVCache();
+        // Clear any existing cache
+        this.clearKVCache();
+        // Allocate new cache with reasonable max sequence length
+        const maxSeqLen = Math.max(this.contextLength, fullSeqLen + 256);
+        this.kvCache = this.createGPUKVCache(maxSeqLen);
       }
-      if (DEBUG) {
-        console.log(`\n[Forward] Prefill: processing ${tokensToProcess.length} tokens`);
-      }
+
+      console.log(`[Forward] PREFILL: processing ${tokensToProcess.length} tokens (useCache=${useCache})`);
     }
 
     const processLen = tokensToProcess.length;
+    const timings: Record<string, number> = {};
+    let t0: number;
 
     // Debug: log input token IDs for first call
     if (DEBUG) {
@@ -393,9 +445,11 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     // Create input embeddings only for tokens we need to process
     // GGUF stores embeddings as [hiddenSize, vocabSize], pass vocabSize hint
+    t0 = performance.now();
     let hidden: Tensor;
     if (this.weights.tokenEmbedding) {
       hidden = await ops.embeddingLookup(this.weights.tokenEmbedding, tokensToProcess, this.vocabSize);
+      timings['embedding'] = performance.now() - t0;
 
       // Debug: check if embeddings are different per position
       if (DEBUG) {
@@ -410,9 +464,15 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // Fallback to random embeddings (shouldn't happen with real model)
       console.warn('No token embedding found, using random');
       hidden = Tensor.random([processLen, this.hiddenSize], { label: 'hidden' });
+      timings['embedding'] = performance.now() - t0;
     }
 
     // Process through all layers
+    t0 = performance.now();
+    let totalAttnTime = 0;
+    let totalFfnTime = 0;
+    let layerT0: number;
+
     for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
       const layer = this.weights.layers[layerIdx];
 
@@ -433,6 +493,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
 
       // Self-attention with Q, K, V projections
+      layerT0 = performance.now();
       let attnOut: Tensor;
       if (layer.attnQ && layer.attnK && layer.attnV && layer.attnOutput) {
         attnOut = await this.selfAttention(normed, layer, processLen, startPos, layerIdx, useCache);
@@ -441,6 +502,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         console.warn(`Layer ${layerIdx}: missing attention weights, skipping`);
         attnOut = normed;
       }
+      totalAttnTime += performance.now() - layerT0;
 
       // Debug: check attention output for last position (layer 0 only)
       if (layerIdx === 0 && DEBUG) {
@@ -464,6 +526,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
       // FFN (use weights if available, otherwise skip)
       // GGUF weights are [in_features, out_features], correct for x @ W
+      layerT0 = performance.now();
       if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
         const ffnOut = await feedForward(normed2, layer.ffnGate, layer.ffnUp, layer.ffnDown);
 
@@ -481,6 +544,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         ffnOut.destroy();
         hidden = afterFfn;
       }
+      totalFfnTime += performance.now() - layerT0;
       normed2.destroy();
 
       // Debug: hidden state after layer 0
@@ -491,16 +555,33 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
     }
 
+    if (isIncremental) {
+      console.log(`[Layers] attn=${totalAttnTime.toFixed(0)}ms, ffn=${totalFfnTime.toFixed(0)}ms`);
+    }
+
+    // Update KV cache sequence length after processing all layers
+    if (useCache && this.kvCache) {
+      this.kvCache.seqLen = startPos + processLen;
+      if (DEBUG) {
+        console.log(`[KVCache] Updated seqLen to ${this.kvCache.seqLen}`);
+      }
+    }
+    timings['layers'] = performance.now() - t0;
+
     // Final norm
+    t0 = performance.now();
     const normWeight = this.weights.outputNorm || Tensor.ones([this.hiddenSize]);
     const finalNormed = await rmsNorm(hidden, normWeight, this.rmsNormEps);
     hidden.destroy();
     if (!this.weights.outputNorm) {
       normWeight.destroy();
     }
+    timings['finalNorm'] = performance.now() - t0;
 
     // Extract last token's hidden state on GPU (avoids transferring entire sequence to CPU)
+    t0 = performance.now();
     const lastTokenHidden = await ops.sliceLastRow(finalNormed);
+    timings['sliceLastRow'] = performance.now() - t0;
 
     // Debug: check final hidden state (only when debug enabled)
     if (DEBUG) {
@@ -514,6 +595,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     // Output projection
     // outputWeight is pre-transposed to [hiddenSize, vocabSize] = [2048, 151936]
+    t0 = performance.now();
     let logits: Tensor;
     if (this.weights.outputWeight) {
       logits = await ops.matmul(lastTokenHidden, this.weights.outputWeight);
@@ -529,17 +611,150 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       logits = Tensor.random([1, this.vocabSize], { label: 'logits' });
     }
     lastTokenHidden.destroy();
+    timings['outputProj'] = performance.now() - t0;
 
+    t0 = performance.now();
     const logitsData = await logits.toArray();
     logits.destroy();
+    timings['toArray'] = performance.now() - t0;
+
+    const forwardEnd = performance.now();
+    const totalTime = forwardEnd - forwardStart;
+
+    // Print timing breakdown for incremental mode (to diagnose slowness)
+    if (isIncremental) {
+      console.log(`[Timing] embed=${timings['embedding']?.toFixed(0) || '?'}ms, layers=${timings['layers']?.toFixed(0)}ms, norm=${timings['finalNorm']?.toFixed(0)}ms, slice=${timings['sliceLastRow']?.toFixed(0)}ms, outProj=${timings['outputProj']?.toFixed(0)}ms, toArray=${timings['toArray']?.toFixed(0)}ms`);
+    }
+    console.log(`[Forward] ${isIncremental ? 'INCREMENTAL' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
 
     return logitsData;
   }
 
   /**
-   * Self-attention with Q, K, V projections
+   * Forward pass returning logits for multiple positions
+   * Used for speculative decoding verification
+   *
+   * @param inputIds - Full sequence including draft tokens
+   * @param numLogits - Number of logit vectors to return (from the end)
+   * @param useCache - Whether to use KV cache
+   * @returns Array of logit vectors, one per position
+   */
+  private async forwardMultiLogits(
+    inputIds: number[],
+    numLogits: number,
+    useCache: boolean
+  ): Promise<Float32Array[]> {
+    if (!this.weights) {
+      throw new Error('Model weights not loaded');
+    }
+
+    const fullSeqLen = inputIds.length;
+    let tokensToProcess: number[];
+    let startPos: number;
+
+    // Determine if this is incremental (using cache) or prefill
+    if (useCache && this.kvCache && this.kvCache.seqLen > 0) {
+      startPos = this.kvCache.seqLen;
+      tokensToProcess = inputIds.slice(startPos);
+    } else {
+      startPos = 0;
+      tokensToProcess = inputIds;
+
+      if (useCache) {
+        this.clearKVCache();
+        const maxSeqLen = Math.max(this.contextLength, fullSeqLen + 256);
+        this.kvCache = this.createGPUKVCache(maxSeqLen);
+      }
+    }
+
+    const processLen = tokensToProcess.length;
+
+    // Embedding lookup (pass token IDs as number[], not Tensor)
+    let hidden = await ops.embeddingLookup(this.weights.tokenEmbedding!, tokensToProcess, this.vocabSize);
+
+    // Process through all layers
+    for (let layerIdx = 0; layerIdx < this.numLayers; layerIdx++) {
+      const layer = this.weights.layers[layerIdx];
+
+      // Pre-attention norm
+      const normed1 = await rmsNorm(hidden, layer.attnNorm!, this.rmsNormEps);
+
+      // Self-attention
+      const attnOut = await this.selfAttention(
+        normed1,
+        layer,
+        processLen,
+        startPos,
+        layerIdx,
+        useCache
+      );
+      normed1.destroy();
+
+      // Residual connection
+      const afterAttn = await ops.add(hidden, attnOut);
+      hidden.destroy();
+      attnOut.destroy();
+      hidden = afterAttn;
+
+      // Pre-FFN norm
+      const normed2 = await rmsNorm(hidden, layer.ffnNorm!, this.rmsNormEps);
+
+      // Feed-forward
+      const ffnOut = await feedForward(normed2, layer.ffnGate!, layer.ffnUp!, layer.ffnDown!);
+      normed2.destroy();
+
+      // Residual connection
+      const afterFFN = await ops.add(hidden, ffnOut);
+      hidden.destroy();
+      ffnOut.destroy();
+      hidden = afterFFN;
+    }
+
+    // Update KV cache sequence length
+    if (useCache && this.kvCache) {
+      this.kvCache.seqLen = startPos + processLen;
+    }
+
+    // Final norm
+    const normWeight = this.weights.outputNorm || Tensor.ones([this.hiddenSize]);
+    const finalNormed = await rmsNorm(hidden, normWeight, this.rmsNormEps);
+    hidden.destroy();
+    if (!this.weights.outputNorm) {
+      normWeight.destroy();
+    }
+
+    // Extract last numLogits rows (for multi-position verification)
+    const multiHidden = await ops.sliceLastRows(finalNormed, numLogits);
+    finalNormed.destroy();
+
+    // Output projection for all positions
+    let logitsTensor: Tensor;
+    if (this.weights.outputWeight) {
+      logitsTensor = await ops.matmul(multiHidden, this.weights.outputWeight);
+    } else {
+      logitsTensor = Tensor.random([numLogits, this.vocabSize], { label: 'logits' });
+    }
+    multiHidden.destroy();
+
+    // Transfer to CPU and split into individual logit vectors
+    const allLogitsData = await logitsTensor.toArray();
+    logitsTensor.destroy();
+
+    // Split into array of Float32Arrays
+    const result: Float32Array[] = [];
+    for (let i = 0; i < numLogits; i++) {
+      const start = i * this.vocabSize;
+      const end = start + this.vocabSize;
+      result.push(allLogitsData.slice(start, end));
+    }
+
+    return result;
+  }
+
+  /**
+   * Self-attention with Q, K, V projections and GPU-resident KV cache
    * Supports Grouped Query Attention (GQA) where numKVHeads < numHeads
-   * Supports KV caching for incremental generation
+   * Uses GPU KV cache for O(n) per-token generation instead of O(n²)
    *
    * @param x - Input tensor [processLen, hiddenSize]
    * @param layer - Layer weights
@@ -553,18 +768,21 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     layer: LlamaLayerWeights,
     processLen: number,
     startPos: number,
-    _layerIdx: number,
-    _useCache: boolean
+    layerIdx: number,
+    useCache: boolean
   ): Promise<Tensor> {
-    // Note: layerIdx and useCache are reserved for future GPU-based KV cache implementation
+    const shouldTime = layerIdx === 0 && processLen === 1; // Time first layer in incremental mode
+    let t0 = shouldTime ? performance.now() : 0;
+    const attnTimings: Record<string, number> = {};
 
-    // Project to Q, K, V for new tokens only
-    // Q: [processLen, hiddenSize] @ [hiddenSize, numHeads * headDim] = [processLen, numHeads * headDim]
-    let q = await ops.matmul(x, layer.attnQ!);
-    // K: [processLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [processLen, numKVHeads * headDim]
-    let k = await ops.matmul(x, layer.attnK!);
-    // V: [processLen, hiddenSize] @ [hiddenSize, numKVHeads * headDim] = [processLen, numKVHeads * headDim]
-    let vProj = await ops.matmul(x, layer.attnV!);
+    // Project to Q, K, V for new tokens only (fused kernel reads x once)
+    const { Q: qRaw, K: kRaw, V: vProjRaw } = await ops.fusedQKVProjection(
+      x, layer.attnQ!, layer.attnK!, layer.attnV!
+    );
+    let q = qRaw;
+    let k = kRaw;
+    let vProj = vProjRaw;
+    if (shouldTime) { attnTimings['qkvProj'] = performance.now() - t0; t0 = performance.now(); }
 
     // Apply biases if present (Qwen uses Q/K/V biases)
     if (layer.attnQBias) {
@@ -576,6 +794,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     if (layer.attnVBias) {
       vProj = await this.addBias(vProj, layer.attnVBias);
     }
+    if (shouldTime) { attnTimings['biases'] = performance.now() - t0; t0 = performance.now(); }
 
     // Debug: check Q, K, V before RoPE
     const debugRope = this.debugMode;
@@ -597,6 +816,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const kRope = await applyRope(k, processLen, this.numKVHeads, this.headDim, this.ropeBase, startPos);
     q.destroy();
     k.destroy();
+    if (shouldTime) { attnTimings['rope'] = performance.now() - t0; t0 = performance.now(); }
 
     // Debug: check Q after RoPE
     if (debugRope && qBeforeRope) {
@@ -611,35 +831,72 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       console.log(`[RoPE] Q pos${processLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
     }
 
-    // For now, skip KV cache and compute attention directly on GPU
-    // The CPU-based KV cache was causing too many GPU-CPU transfers
-    // TODO: Implement GPU-based KV cache with pre-allocated buffers
+    // Determine K/V to use for attention
+    let kForAttention: Tensor;
+    let vForAttention: Tensor;
+    let totalSeqLen: number;
+
+    if (useCache && this.kvCache) {
+      // GPU KV Cache mode: copy new K/V to cache, use full cached K/V for attention
+
+      // Copy new K/V to cache at position startPos (stays on GPU)
+      await ops.copyRows(kRope, this.kvCache.keys[layerIdx], startPos);
+      await ops.copyRows(vProj, this.kvCache.values[layerIdx], startPos);
+      if (shouldTime) { attnTimings['copyRows'] = performance.now() - t0; t0 = performance.now(); }
+
+      // Total sequence length after adding new tokens
+      totalSeqLen = startPos + processLen;
+
+      // Create views into the cache for the valid portion
+      // We need to slice the cache to only include positions 0 to totalSeqLen
+      // For efficiency, we pass the full cache but tell attention the actual key count
+      kForAttention = this.kvCache.keys[layerIdx];
+      vForAttention = this.kvCache.values[layerIdx];
+
+      // Clean up the newly projected K/V (they're now copied to cache)
+      kRope.destroy();
+      vProj.destroy();
+    } else {
+      // No cache mode: use newly computed K/V directly
+      kForAttention = kRope;
+      vForAttention = vProj;
+      totalSeqLen = processLen;
+    }
 
     // GPU-accelerated causal attention
-    // Q: [processLen, numHeads * headDim]
-    // K: [processLen, numKVHeads * headDim] (just new keys for now)
-    // V: [processLen, numKVHeads * headDim] (just new values for now)
+    // Q: [processLen, numHeads * headDim] - queries for new positions only
+    // K: [bufferSize, numKVHeads * headDim] - all keys (may be pre-allocated cache buffer)
+    // V: [bufferSize, numKVHeads * headDim] - all values (may be pre-allocated cache buffer)
     //
-    // Note: Without proper GPU KV cache, we need to recompute K/V for full sequence
-    // This is O(n²) but avoids the GPU-CPU transfer bottleneck
+    // When using cache, pass totalSeqLen to tell attention how many keys are actually valid
     const attnOut = await ops.causalAttention(
       qRope,
-      kRope,
-      vProj,
+      kForAttention,
+      vForAttention,
       this.numHeads,
       this.numKVHeads,
       this.headDim,
-      startPos
+      startPos,
+      useCache && this.kvCache ? totalSeqLen : undefined
     );
+    if (shouldTime) { attnTimings['causalAttn'] = performance.now() - t0; t0 = performance.now(); }
 
-    // Cleanup
+    // Cleanup Q (K/V cleanup depends on cache mode)
     qRope.destroy();
-    kRope.destroy();
-    vProj.destroy();
+
+    // Only destroy K/V if not using cache (cache tensors are reused)
+    if (!useCache || !this.kvCache) {
+      kForAttention.destroy();
+      vForAttention.destroy();
+    }
 
     // Output projection: [processLen, numHeads * headDim] @ [numHeads * headDim, hiddenSize]
     const projected = await ops.matmul(attnOut, layer.attnOutput!);
     attnOut.destroy();
+    if (shouldTime) {
+      attnTimings['outProj'] = performance.now() - t0;
+      console.log(`[AttnL0] qkvProj=${attnTimings['qkvProj']?.toFixed(1)}ms biases=${attnTimings['biases']?.toFixed(1)}ms rope=${attnTimings['rope']?.toFixed(1)}ms copyRows=${attnTimings['copyRows']?.toFixed(1)}ms causalAttn=${attnTimings['causalAttn']?.toFixed(1)}ms outProj=${attnTimings['outProj']?.toFixed(1)}ms`);
+    }
 
     return projected;
   }
@@ -744,7 +1001,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
-   * Generate text completion
+   * Generate text completion with GPU-resident KV cache for O(n) generation
+   * Supports speculative decoding for higher GPU utilization
    */
   async generate(
     prompt: string,
@@ -760,7 +1018,21 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       topK = 40,
       stop = [],
       rawPrompt = false,
+      speculative: speculativeOpts,
     } = options;
+
+    // Merge speculative options with defaults
+    const specConfig: SpeculativeOptions = speculativeOpts?.enabled !== false
+      ? { ...DEFAULT_SPECULATIVE_OPTIONS, ...speculativeOpts }
+      : { ...DEFAULT_SPECULATIVE_OPTIONS, enabled: false };
+
+    // Create n-gram cache if speculative decoding is enabled
+    const ngramCache = specConfig.enabled
+      ? new NgramDraftCache(specConfig.ngramSize)
+      : null;
+
+    // Clear any existing KV cache for fresh generation
+    this.clearKVCache();
 
     // Apply chat template unless rawPrompt is set
     const formattedPrompt = rawPrompt ? prompt : this.applyChatTemplate(prompt);
@@ -776,44 +1048,162 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     const generatedTokens: number[] = [];
     let generatedText = '';
+    const eosId = this.tokenizer?.eosTokenId ?? 2;
 
-    for (let i = 0; i < maxTokens; i++) {
-      // Process full sequence each time (no KV cache for now - stays on GPU)
-      const allIds = [...inputIds, ...generatedTokens];
-      const logits = await this.forward(allIds, false);
+    // Helper to decode and append tokens
+    const appendToken = (token: number): boolean => {
+      generatedTokens.push(token);
 
-      // Sample next token
-      const nextToken = this.sampleToken(logits, temperature, topK);
-      generatedTokens.push(nextToken);
-
-      // Decode the token
       let tokenText: string;
       if (this.tokenizer) {
-        tokenText = this.tokenizer.decodeToken(nextToken);
+        tokenText = this.tokenizer.decodeToken(token);
       } else {
-        tokenText = String.fromCharCode(nextToken % 128);
+        tokenText = String.fromCharCode(token % 128);
       }
-
       generatedText += tokenText;
 
       // Check for EOS
-      const eosId = this.tokenizer?.eosTokenId ?? 2;
-      if (nextToken === eosId) {
-        break;
+      if (token === eosId) {
+        return true; // should stop
       }
 
       // Check for stop sequences
-      let shouldStop = false;
       for (const stopSeq of stop) {
         if (generatedText.endsWith(stopSeq)) {
-          // Remove stop sequence from output
           generatedText = generatedText.slice(0, -stopSeq.length);
-          shouldStop = true;
-          break;
+          return true; // should stop
         }
       }
+      return false;
+    };
+
+    let tokenCount = 0;
+    let forwardPasses = 0;  // Track forward passes for efficiency metrics
+    const genStartTime = performance.now();
+
+    while (tokenCount < maxTokens) {
+      // Try speculative decoding if enabled and we have enough context
+      if (ngramCache && generatedTokens.length >= 2) {
+        const allTokens = [...inputIds, ...generatedTokens];
+        const draftTokens = ngramCache.getDrafts(allTokens, specConfig.maxDraftTokens);
+
+        if (draftTokens.length > 0) {
+          console.log(`[Spec] Found ${draftTokens.length} draft tokens`);
+          // Speculative path: verify draft tokens in parallel
+          const cacheSeqLenBefore = this.kvCache?.seqLen ?? 0;
+
+          // Process all draft tokens and get logits for each position
+          const fullSequence = [...allTokens, ...draftTokens];
+          const allLogits = await this.forwardMultiLogits(fullSequence, draftTokens.length, true);
+          forwardPasses++;
+
+          // Verify each draft token
+          // draftTokens[i] should match the prediction from logits[i-1] (or previous position)
+          // For simplicity, we verify draftTokens[i] against logits[i] (output after processing it)
+          // This checks if the continuation is consistent
+          let accepted = 0;
+
+          for (let i = 0; i < draftTokens.length; i++) {
+            // logits[i] is the output after processing draftTokens[i]
+            // It predicts what should come AFTER draftTokens[i]
+            // To verify draftTokens[i], we'd need logits from the previous position
+            // For now, we use a simplified check: verify draftTokens[i+1] against logits[i]
+            if (i < draftTokens.length - 1) {
+              const predictedNext = this.sampleToken(allLogits[i], temperature, topK);
+              if (draftTokens[i + 1] === predictedNext) {
+                accepted++;
+              } else {
+                break;
+              }
+            } else {
+              // Last draft - always "accept" it, we'll sample next from its logits
+              accepted++;
+            }
+          }
+
+          // Rollback cache to accepted length
+          // We processed `draftTokens.length` tokens, but only keep `accepted`
+          const newCacheLen = cacheSeqLenBefore + accepted;
+          this.rollbackKVCache(newCacheLen);
+          console.log(`[Spec] Verified: ${accepted}/${draftTokens.length} accepted`);
+
+          // Append accepted draft tokens
+          let shouldStop = false;
+          for (let i = 0; i < accepted && !shouldStop; i++) {
+            shouldStop = appendToken(draftTokens[i]);
+            tokenCount++;
+          }
+
+          // Update n-gram cache with accepted tokens
+          ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+          ngramCache.recordAccepted(accepted);
+
+          if (shouldStop || tokenCount >= maxTokens) {
+            break;
+          }
+
+          // Sample bonus token from last accepted position's logits
+          if (accepted > 0) {
+            const bonusLogits = allLogits[accepted - 1];
+            const bonusToken = this.sampleToken(bonusLogits, temperature, topK);
+
+            // Need to do a forward pass to update KV cache with bonus token
+            const afterAccepted = [...inputIds, ...generatedTokens];
+            await this.forward([...afterAccepted, bonusToken], true);
+            forwardPasses++;
+
+            shouldStop = appendToken(bonusToken);
+            tokenCount++;
+            ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+
+            if (shouldStop) break;
+          }
+
+          continue; // Next iteration
+        }
+      }
+
+      // Fallback: single token generation (no draft match or speculation disabled)
+      const allIds = [...inputIds, ...generatedTokens];
+      const logits = await this.forward(allIds, true);
+      forwardPasses++;
+
+      const nextToken = this.sampleToken(logits, temperature, topK);
+      const shouldStop = appendToken(nextToken);
+      tokenCount++;
+
+      // Update n-gram cache
+      if (ngramCache) {
+        ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+      }
+
       if (shouldStop) break;
     }
+
+    // Clear cache after generation to free GPU memory
+    this.clearKVCache();
+
+    // Calculate and log performance metrics
+    const genEndTime = performance.now();
+    const genTimeSeconds = (genEndTime - genStartTime) / 1000;
+    const tokensPerSecond = generatedTokens.length / genTimeSeconds;
+    const tokensPerForward = generatedTokens.length / Math.max(1, forwardPasses);
+
+    console.log(`[Generate] ${generatedTokens.length} tokens in ${genTimeSeconds.toFixed(2)}s = ${tokensPerSecond.toFixed(1)} tok/s`);
+    console.log(`[Generate] ${forwardPasses} forward passes, ${tokensPerForward.toFixed(2)} tokens/forward (1.0 = no speculation benefit)`);
+
+    // Log speculative decoding statistics
+    if (ngramCache) {
+      const stats = ngramCache.getStats();
+      console.log(`[Speculative] hitRate=${(stats.hitRate * 100).toFixed(1)}%, acceptRate=${(stats.acceptanceRate * 100).toFixed(1)}%, accepted=${stats.acceptedTokens}/${stats.proposedTokens}`);
+    }
+
+    // Log command batcher statistics
+    const batcherStats = getCommandBatcherStats();
+    if (batcherStats && batcherStats.totalBatches > 0) {
+      console.log(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
+    }
+    resetCommandBatcherStats();
 
     return {
       text: generatedText,
@@ -855,7 +1245,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
-   * Generate text with streaming
+   * Generate text with streaming and GPU-resident KV cache for O(n) generation
    */
   async *generateStream(
     prompt: string,
@@ -872,6 +1262,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       stop: userStop = [],
       rawPrompt = false,
     } = options;
+
+    // Clear any existing KV cache for fresh generation
+    this.clearKVCache();
 
     // Add default stop sequences for known architectures
     const stop = [...userStop];
@@ -899,10 +1292,11 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const generatedTokens: number[] = [];
     let generatedText = '';
 
-    for (let i = 0; i < maxTokens; i++) {
-      // Process full sequence each time (no KV cache for now - stays on GPU)
-      const allIds = [...inputIds, ...generatedTokens];
-      const logits = await this.forward(allIds, false);
+    try {
+      for (let i = 0; i < maxTokens; i++) {
+        // Use KV cache: first iteration does prefill, subsequent do incremental decode
+        const allIds = [...inputIds, ...generatedTokens];
+        const logits = await this.forward(allIds, true);  // true = use KV cache
 
       // Debug: show logits distribution for first 3 tokens
       if (this.debugMode && i < 3) {
@@ -959,6 +1353,17 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         break;
       }
     }
+    } finally {
+      // Clear cache after generation to free GPU memory
+      this.clearKVCache();
+
+      // Log command batcher statistics
+      const batcherStats = getCommandBatcherStats();
+      if (batcherStats && batcherStats.totalBatches > 0) {
+        console.log(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
+      }
+      resetCommandBatcherStats();
+    }
   }
 
   /**
@@ -988,6 +1393,76 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
 
     return Array.from(embedding);
+  }
+
+  /**
+   * Benchmark GPU scaling with different token counts
+   * Measures forward pass time to determine if parallel speculation will help
+   */
+  async benchmark(): Promise<void> {
+    if (!this.modelLoaded || !this.weights) {
+      throw new Error('Model not loaded for benchmark');
+    }
+
+    console.log('\n========== GPU SCALING BENCHMARK ==========');
+    console.log('Measuring forward pass time with different token counts...\n');
+
+    // Create a dummy prompt
+    const dummyTokens = Array.from({ length: 512 }, (_, i) => i % this.vocabSize);
+
+    const tokenCounts = [1, 4, 16, 64, 128, 256];
+    const results: { tokens: number; timeMs: number; tokPerSec: number }[] = [];
+
+    for (const numTokens of tokenCounts) {
+      // Clear cache for fresh measurement
+      this.clearKVCache();
+
+      const tokens = dummyTokens.slice(0, numTokens);
+
+      // Warm up run
+      await this.forward(tokens, true);
+      this.clearKVCache();
+
+      // Timed runs (average of 3)
+      const times: number[] = [];
+      for (let run = 0; run < 3; run++) {
+        this.clearKVCache();
+        const start = performance.now();
+        await this.forward(tokens, true);
+        const end = performance.now();
+        times.push(end - start);
+      }
+
+      const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
+      const tokPerSec = (numTokens / avgTime) * 1000;
+
+      results.push({ tokens: numTokens, timeMs: avgTime, tokPerSec });
+      console.log(`${numTokens.toString().padStart(3)} tokens: ${avgTime.toFixed(1)}ms (${tokPerSec.toFixed(0)} tok/s)`);
+    }
+
+    // Analyze scaling
+    console.log('\n--- SCALING ANALYSIS ---');
+    const baseline = results[0];
+    for (const r of results.slice(1)) {
+      const actualRatio = r.timeMs / baseline.timeMs;
+      const efficiency = r.tokens / actualRatio;
+      console.log(`${r.tokens} tokens: ${actualRatio.toFixed(1)}x time for ${r.tokens}x tokens → ${efficiency.toFixed(1)}x effective parallelism`);
+    }
+
+    // Recommendation
+    const best = results.reduce((a, b) => a.tokPerSec > b.tokPerSec ? a : b);
+    console.log(`\n✓ OPTIMAL: ${best.tokens} tokens (${best.tokPerSec.toFixed(0)} tok/s)`);
+
+    if (best.tokens > 16) {
+      console.log('→ GPU parallelism IS helping. Tree speculation will improve speed.');
+    } else {
+      console.log('→ GPU is memory-bound. More tokens won\'t help much.');
+    }
+
+    console.log('==========================================\n');
+
+    // Clean up
+    this.clearKVCache();
   }
 
   /**

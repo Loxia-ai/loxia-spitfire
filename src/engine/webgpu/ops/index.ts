@@ -12,6 +12,7 @@ import {
   executeCompute,
   calculateWorkgroups,
   calculateWorkgroups2D,
+  requestBufferDestroy,
 } from '../shader.js';
 import {
   createStorageBuffer,
@@ -213,9 +214,11 @@ async function runElementwise(input: Tensor, op: string): Promise<Tensor> {
   ]);
 
   const workgroups = calculateWorkgroups(input.size, 256);
-  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1]);
+  // Track buffers used by this operation for proper disposal timing (including params!)
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -239,9 +242,10 @@ async function runBinary(a: Tensor, b: Tensor, op: string): Promise<Tensor> {
   ]);
 
   const workgroups = calculateWorkgroups(a.size, 256);
-  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [a.getBuffer(), b.getBuffer(), output.getBuffer(), params];
+  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -260,9 +264,10 @@ async function runScalar(input: Tensor, scalar: number, op: string): Promise<Ten
   ]);
 
   const workgroups = calculateWorkgroups(input.size, 256);
-  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -359,9 +364,10 @@ export async function broadcastAdd(input: Tensor, bias: Tensor): Promise<Tensor>
   ]);
 
   const workgroups = calculateWorkgroups(seqLen * dim, 256);
-  await executeCompute(broadcastAddPipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [input.getBuffer(), bias.getBuffer(), output.getBuffer(), params];
+  await executeCompute(broadcastAddPipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -450,6 +456,13 @@ let matmulPipeline: GPUComputePipeline | null = null;
 /**
  * Matrix multiplication: C = A @ B
  * A: [M, K], B: [K, N] -> C: [M, N]
+ *
+ * Uses specialized GEMV shader when M=1 for much better performance
+ * on single-token inference (avoids wasteful 8x8 workgroups).
+ */
+/**
+ * Matrix multiplication: C = A @ B
+ * A: [M, K], B: [K, N] -> C: [M, N]
  */
 export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
   if (a.ndim !== 2 || b.ndim !== 2) {
@@ -465,6 +478,9 @@ export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
 
   const K = K1;
 
+  // Tiled matmul - works for all M values including M=1
+  // Note: We tested a specialized GEMV shader for M=1 but it had identical
+  // performance due to WebGPU/Dawn overhead dominating computation time
   if (!matmulPipeline) {
     matmulPipeline = createComputePipelineFromSource(MATMUL_SHADER, {
       label: 'matmul',
@@ -487,9 +503,10 @@ export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
   ]);
 
   const [wgX, wgY] = calculateWorkgroups2D(N, M, 8, 8);
-  await executeCompute(matmulPipeline, [bindGroup], [wgX, wgY, 1]);
+  const usedBuffers = [a.getBuffer(), b.getBuffer(), output.getBuffer(), params];
+  await executeCompute(matmulPipeline, [bindGroup], [wgX, wgY, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -614,9 +631,10 @@ async function runReduce(input: Tensor, op: string): Promise<number> {
       { binding: 2, resource: params },
     ]);
 
-    await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1]);
+    const usedBuffers = [current.getBuffer(), outputBuffer, params];
+    await executeCompute(pipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-    params.destroy();
+    requestBufferDestroy(params);
 
     if (current !== input) {
       current.destroy();
@@ -748,9 +766,10 @@ export async function softmax(x: Tensor): Promise<Tensor> {
     { binding: 2, resource: params },
   ]);
 
-  await executeCompute(softmaxPipeline, [bindGroup], [batchSize, 1, 1]);
+  const usedBuffers = [x.getBuffer(), output.getBuffer(), params];
+  await executeCompute(softmaxPipeline, [bindGroup], [batchSize, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -767,6 +786,8 @@ export function resetOpsPipelines(): void {
   embeddingPipeline = null;
   broadcastAddPipeline = null;
   sliceLastRowPipeline = null;
+  copyRowsPipeline = null;
+  causalAttentionPipeline = null;
 }
 
 // ============================================================================
@@ -905,10 +926,11 @@ export async function embeddingLookup(
 
   const totalElements = seqLen * hiddenSize;
   const workgroups = calculateWorkgroups(totalElements, 256);
-  await executeCompute(embeddingPipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [embeddings.getBuffer(), indicesBuffer, output.getBuffer(), params];
+  await executeCompute(embeddingPipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
-  indicesBuffer.destroy();
+  requestBufferDestroy(params);
+  requestBufferDestroy(indicesBuffer);
 
   return output;
 }
@@ -1070,12 +1092,13 @@ let causalAttentionPipeline: GPUComputePipeline | null = null;
  * GPU-accelerated causal attention with GQA support
  *
  * @param Q - Query tensor [numQPos, numHeads * headDim]
- * @param K - Key tensor [numKeys, numKVHeads * headDim]
- * @param V - Value tensor [numKeys, numKVHeads * headDim]
+ * @param K - Key tensor [bufferSize, numKVHeads * headDim] (may be larger than numKeys for cached buffers)
+ * @param V - Value tensor [bufferSize, numKVHeads * headDim] (may be larger than numKeys for cached buffers)
  * @param numHeads - Number of query heads
  * @param numKVHeads - Number of KV heads (for GQA)
  * @param headDim - Dimension per head
  * @param startPos - Starting position for queries (for incremental inference)
+ * @param numKeysOverride - Optional: actual number of valid keys in K/V (for KV cache with pre-allocated buffers)
  * @returns Output tensor [numQPos, numHeads * headDim]
  */
 export async function causalAttention(
@@ -1085,7 +1108,8 @@ export async function causalAttention(
   numHeads: number,
   numKVHeads: number,
   headDim: number,
-  startPos: number = 0
+  startPos: number = 0,
+  numKeysOverride?: number
 ): Promise<Tensor> {
   if (!causalAttentionPipeline) {
     causalAttentionPipeline = createComputePipelineFromSource(CAUSAL_ATTENTION_SHADER, {
@@ -1095,7 +1119,8 @@ export async function causalAttention(
   }
 
   const numQPos = Q.shape[0];
-  const numKeys = K.shape[0];
+  // Use override if provided (for KV cache), otherwise use K's shape
+  const numKeys = numKeysOverride ?? K.shape[0];
   const scale = 1.0 / Math.sqrt(headDim);
 
   const output = Tensor.empty([numQPos, numHeads * headDim], { label: 'attention_output' });
@@ -1124,9 +1149,10 @@ export async function causalAttention(
 
   // One workgroup per (qPos, head) pair
   const numWorkgroups = numQPos * numHeads;
-  await executeCompute(causalAttentionPipeline, [bindGroup], [numWorkgroups, 1, 1]);
+  const usedBuffers = [Q.getBuffer(), K.getBuffer(), V.getBuffer(), output.getBuffer(), params];
+  await executeCompute(causalAttentionPipeline, [bindGroup], [numWorkgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
 }
 
@@ -1194,10 +1220,197 @@ export async function sliceLastRow(input: Tensor): Promise<Tensor> {
   ]);
 
   const workgroups = calculateWorkgroups(cols, 256);
-  await executeCompute(sliceLastRowPipeline, [bindGroup], [workgroups, 1, 1]);
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(sliceLastRowPipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
+}
+
+// ============================================================================
+// Slice Last N Rows (for speculative decoding multi-position logits)
+// ============================================================================
+
+const SLICE_LAST_ROWS_SHADER = `
+struct Params {
+  totalRows: u32,    // Total rows in input
+  numCols: u32,      // Number of columns
+  numRowsToSlice: u32, // How many rows to extract from end
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let numCols = params.numCols;
+  let numRowsToSlice = params.numRowsToSlice;
+  let totalElements = numRowsToSlice * numCols;
+
+  if (idx >= totalElements) { return; }
+
+  // Calculate which row and column this thread handles
+  let outRow = idx / numCols;
+  let col = idx % numCols;
+
+  // Map to input row (last numRowsToSlice rows)
+  let startRow = params.totalRows - numRowsToSlice;
+  let inRow = startRow + outRow;
+
+  output[idx] = input[inRow * numCols + col];
+}
+`;
+
+let sliceLastRowsPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Extract the last N rows of a 2D tensor on GPU
+ * input: [rows, cols] -> output: [numRows, cols]
+ * Used for speculative decoding to get logits at multiple positions
+ */
+export async function sliceLastRows(input: Tensor, numRows: number): Promise<Tensor> {
+  if (input.ndim !== 2) {
+    throw new Error('sliceLastRows requires 2D tensor');
+  }
+
+  const [totalRows, cols] = input.shape;
+  if (numRows > totalRows) {
+    throw new Error(`Cannot slice ${numRows} rows from tensor with ${totalRows} rows`);
+  }
+
+  // Optimize: if only 1 row, use the existing sliceLastRow
+  if (numRows === 1) {
+    return sliceLastRow(input);
+  }
+
+  if (!sliceLastRowsPipeline) {
+    sliceLastRowsPipeline = createComputePipelineFromSource(SLICE_LAST_ROWS_SHADER, {
+      label: 'slice_last_rows',
+      entryPoint: 'main',
+    });
+  }
+
+  const output = Tensor.empty([numRows, cols], { label: 'last_rows' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([totalRows, cols, numRows, 0]),
+    'slice_last_rows_params'
+  );
+
+  const bindGroup = createBindGroup(sliceLastRowsPipeline, 0, [
+    { binding: 0, resource: input.getBuffer() },
+    { binding: 1, resource: output.getBuffer() },
+    { binding: 2, resource: params },
+  ]);
+
+  const totalElements = numRows * cols;
+  const workgroups = calculateWorkgroups(totalElements, 256);
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(sliceLastRowsPipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return output;
+}
+
+// ============================================================================
+// KV Cache Operations
+// ============================================================================
+
+const COPY_ROWS_SHADER = `
+// Copy rows from source to destination at specified position
+// Used for updating KV cache: cache[startRow:startRow+numRows] = source[0:numRows]
+struct Params {
+  numRows: u32,      // Number of rows to copy
+  numCols: u32,      // Number of columns (row width)
+  startRow: u32,     // Starting row in destination
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dest: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let totalElements = params.numRows * params.numCols;
+
+  if (idx >= totalElements) { return; }
+
+  // Calculate source and dest indices
+  let row = idx / params.numCols;
+  let col = idx % params.numCols;
+  let destRow = params.startRow + row;
+
+  let srcIdx = row * params.numCols + col;
+  let dstIdx = destRow * params.numCols + col;
+
+  dest[dstIdx] = source[srcIdx];
+}
+`;
+
+let copyRowsPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Copy rows from source tensor to destination tensor at a specific position
+ * Used for updating KV cache: dest[startRow:startRow+source.rows] = source
+ *
+ * @param source - Source tensor [numRows, numCols]
+ * @param dest - Destination tensor (must be large enough)
+ * @param startRow - Starting row position in destination
+ */
+export async function copyRows(
+  source: Tensor,
+  dest: Tensor,
+  startRow: number
+): Promise<void> {
+  if (source.ndim !== 2 || dest.ndim !== 2) {
+    throw new Error('copyRows requires 2D tensors');
+  }
+
+  const [srcRows, srcCols] = source.shape;
+  const [, destCols] = dest.shape;
+
+  if (srcCols !== destCols) {
+    throw new Error(`Column mismatch: source has ${srcCols}, dest has ${destCols}`);
+  }
+
+  if (!copyRowsPipeline) {
+    copyRowsPipeline = createComputePipelineFromSource(COPY_ROWS_SHADER, {
+      label: 'copy_rows',
+      entryPoint: 'main',
+    });
+  }
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([srcRows, srcCols, startRow, 0]),
+    'copy_rows_params'
+  );
+
+  const bindGroup = createBindGroup(copyRowsPipeline, 0, [
+    { binding: 0, resource: source.getBuffer() },
+    { binding: 1, resource: dest.getBuffer() },
+    { binding: 2, resource: params },
+  ]);
+
+  const totalElements = srcRows * srcCols;
+  const workgroups = calculateWorkgroups(totalElements, 256);
+  const usedBuffers = [source.getBuffer(), dest.getBuffer(), params];
+  await executeCompute(copyRowsPipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+}
+
+/**
+ * Create a pre-allocated cache tensor for KV cache
+ * @param maxSeqLen - Maximum sequence length to support
+ * @param dim - Dimension per row (numKVHeads * headDim)
+ */
+export function createCacheTensor(maxSeqLen: number, dim: number): Tensor {
+  return Tensor.zeros([maxSeqLen, dim], { label: 'kv_cache' });
 }
 
 // ============================================================================
@@ -1267,8 +1480,359 @@ export async function transpose(input: Tensor): Promise<Tensor> {
   ]);
 
   const [wgX, wgY] = calculateWorkgroups2D(cols, rows, 16, 16);
-  await executeCompute(transposePipeline, [bindGroup], [wgX, wgY, 1]);
+  const usedBuffers = [input.getBuffer(), output.getBuffer(), params];
+  await executeCompute(transposePipeline, [bindGroup], [wgX, wgY, 1], undefined, false, true, usedBuffers);
 
-  params.destroy();
+  requestBufferDestroy(params);
   return output;
+}
+
+// ============================================================================
+// Fused SwiGLU (Gate + Up + SiLU + Mul)
+// Combines: silu(x @ W_gate) * (x @ W_up) into single kernel
+// ============================================================================
+
+const FUSED_SWIGLU_SHADER = `
+// Fused SwiGLU: output = silu(x @ W_gate) * (x @ W_up)
+// Reads input x only once, eliminates intermediate tensors
+
+struct Params {
+  M: u32,            // Batch/sequence dimension
+  hidden: u32,       // Input hidden dimension
+  intermediate: u32, // Output intermediate dimension
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> W_gate: array<f32>;
+@group(0) @binding(2) var<storage, read> W_up: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+// SiLU activation: x * sigmoid(x) = x / (1 + exp(-x))
+fn silu(val: f32) -> f32 {
+  return val / (1.0 + exp(-val));
+}
+
+// Tile size for K dimension (input hidden)
+const TILE_K: u32 = 64u;
+var<workgroup> sharedX: array<f32, 64>;
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>
+) {
+  let tid = lid.x;
+  let M = params.M;
+  let hidden = params.hidden;
+  let intermediate = params.intermediate;
+
+  // Each workgroup handles one row (m), threads handle output columns
+  let m = wid.y;
+  let outCol = wid.x * 256u + tid;
+
+  // Check if this thread computes a valid output (but don't return early - must hit barriers)
+  let isValid = (m < M) && (outCol < intermediate);
+
+  var gateAccum: f32 = 0.0;
+  var upAccum: f32 = 0.0;
+
+  let numTiles = (hidden + TILE_K - 1u) / TILE_K;
+
+  for (var tile = 0u; tile < numTiles; tile++) {
+    // Cooperative load of x tile into shared memory
+    // First 64 threads load the tile
+    if (tid < TILE_K) {
+      let loadIdx = tile * TILE_K + tid;
+      if (loadIdx < hidden && m < M) {
+        sharedX[tid] = x[m * hidden + loadIdx];
+      } else {
+        sharedX[tid] = 0.0;
+      }
+    }
+    workgroupBarrier();
+
+    // Compute partial dot products for both gate and up (only if valid)
+    if (isValid) {
+      let tileEnd = min(TILE_K, hidden - tile * TILE_K);
+      for (var k = 0u; k < tileEnd; k++) {
+        let globalK = tile * TILE_K + k;
+        let xVal = sharedX[k];
+
+        // Weight access: W[globalK, outCol] = W[globalK * intermediate + outCol]
+        let gateWeight = W_gate[globalK * intermediate + outCol];
+        let upWeight = W_up[globalK * intermediate + outCol];
+
+        gateAccum += xVal * gateWeight;
+        upAccum += xVal * upWeight;
+      }
+    }
+    workgroupBarrier();
+  }
+
+  // Apply SiLU to gate and multiply with up (only write if valid)
+  if (isValid) {
+    let gateAct = silu(gateAccum);
+    output[m * intermediate + outCol] = gateAct * upAccum;
+  }
+}
+`;
+
+let fusedSwiGLUPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Fused SwiGLU: silu(x @ W_gate) * (x @ W_up)
+ * Reads input x only once and fuses activation with multiply
+ * Reduces 4 kernel calls to 1
+ *
+ * @param x - Input tensor [M, hidden]
+ * @param wGate - Gate weight [hidden, intermediate]
+ * @param wUp - Up weight [hidden, intermediate]
+ * @returns Output tensor [M, intermediate]
+ */
+export async function fusedSwiGLU(
+  x: Tensor,
+  wGate: Tensor,
+  wUp: Tensor
+): Promise<Tensor> {
+  if (!fusedSwiGLUPipeline) {
+    fusedSwiGLUPipeline = createComputePipelineFromSource(FUSED_SWIGLU_SHADER, {
+      label: 'fused_swiglu',
+      entryPoint: 'main',
+    });
+  }
+
+  const M = x.shape[0];
+  const hidden = x.shape[1];
+  const intermediate = wGate.shape[1];
+
+  const output = Tensor.empty([M, intermediate], { label: 'swiglu_output' });
+
+  // Pack params: M, hidden, intermediate, pad
+  const paramsData = new ArrayBuffer(16);
+  const view = new DataView(paramsData);
+  view.setUint32(0, M, true);
+  view.setUint32(4, hidden, true);
+  view.setUint32(8, intermediate, true);
+  view.setUint32(12, 0, true);
+
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'swiglu_params');
+
+  const bindGroup = createBindGroup(fusedSwiGLUPipeline, 0, [
+    { binding: 0, resource: x.getBuffer() },
+    { binding: 1, resource: wGate.getBuffer() },
+    { binding: 2, resource: wUp.getBuffer() },
+    { binding: 3, resource: output.getBuffer() },
+    { binding: 4, resource: params },
+  ]);
+
+  // Workgroups: X covers intermediate dimension, Y covers M
+  const wgX = Math.ceil(intermediate / 256);
+  const wgY = M;
+
+  const usedBuffers = [x.getBuffer(), wGate.getBuffer(), wUp.getBuffer(), output.getBuffer(), params];
+  await executeCompute(fusedSwiGLUPipeline, [bindGroup], [wgX, wgY, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return output;
+}
+
+// ============================================================================
+// Fused QKV Projection
+// Combines: Q = x @ Wq, K = x @ Wk, V = x @ Wv into single kernel
+// ============================================================================
+
+const FUSED_QKV_SHADER = `
+// Fused QKV Projection: outputs Q, K, V from single input read
+// Reads input x only once instead of 3 times
+
+struct Params {
+  M: u32,       // Batch/sequence dimension
+  hidden: u32,  // Input hidden dimension
+  qDim: u32,    // Q output dimension (numHeads * headDim)
+  kDim: u32,    // K output dimension (numKVHeads * headDim)
+  vDim: u32,    // V output dimension (numKVHeads * headDim)
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> Wq: array<f32>;
+@group(0) @binding(2) var<storage, read> Wk: array<f32>;
+@group(0) @binding(3) var<storage, read> Wv: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(5) var<storage, read_write> K: array<f32>;
+@group(0) @binding(6) var<storage, read_write> V: array<f32>;
+@group(0) @binding(7) var<uniform> params: Params;
+
+const TILE_K: u32 = 64u;
+var<workgroup> sharedX: array<f32, 64>;
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>
+) {
+  let tid = lid.x;
+  let M = params.M;
+  let hidden = params.hidden;
+  let qDim = params.qDim;
+  let kDim = params.kDim;
+  let vDim = params.vDim;
+
+  // Row index (batch dimension)
+  let m = wid.y;
+
+  // Global output column across all three matrices
+  let globalCol = wid.x * 256u + tid;
+  let totalCols = qDim + kDim + vDim;
+
+  // Check validity but don't return early (must hit barriers)
+  let isValid = (m < M) && (globalCol < totalCols);
+
+  // Determine which matrix (Q=0, K=1, V=2) and local column
+  // Use safe defaults for invalid threads
+  var targetMatrix: u32 = 0u;
+  var localCol: u32 = 0u;
+
+  if (isValid) {
+    if (globalCol < qDim) {
+      targetMatrix = 0u;
+      localCol = globalCol;
+    } else if (globalCol < qDim + kDim) {
+      targetMatrix = 1u;
+      localCol = globalCol - qDim;
+    } else {
+      targetMatrix = 2u;
+      localCol = globalCol - qDim - kDim;
+    }
+  }
+
+  var accum: f32 = 0.0;
+  let numTiles = (hidden + TILE_K - 1u) / TILE_K;
+
+  for (var tile = 0u; tile < numTiles; tile++) {
+    // Cooperative load of x tile
+    if (tid < TILE_K) {
+      let loadIdx = tile * TILE_K + tid;
+      if (loadIdx < hidden && m < M) {
+        sharedX[tid] = x[m * hidden + loadIdx];
+      } else {
+        sharedX[tid] = 0.0;
+      }
+    }
+    workgroupBarrier();
+
+    // Compute partial dot product (only if valid)
+    if (isValid) {
+      let tileEnd = min(TILE_K, hidden - tile * TILE_K);
+      for (var k = 0u; k < tileEnd; k++) {
+        let globalK = tile * TILE_K + k;
+        let xVal = sharedX[k];
+
+        var weight: f32;
+        if (targetMatrix == 0u) {
+          weight = Wq[globalK * qDim + localCol];
+        } else if (targetMatrix == 1u) {
+          weight = Wk[globalK * kDim + localCol];
+        } else {
+          weight = Wv[globalK * vDim + localCol];
+        }
+
+        accum += xVal * weight;
+      }
+    }
+    workgroupBarrier();
+  }
+
+  // Write output to appropriate matrix (only if valid)
+  if (isValid) {
+    if (targetMatrix == 0u) {
+      Q[m * qDim + localCol] = accum;
+    } else if (targetMatrix == 1u) {
+      K[m * kDim + localCol] = accum;
+    } else {
+      V[m * vDim + localCol] = accum;
+    }
+  }
+}
+`;
+
+let fusedQKVPipeline: GPUComputePipeline | null = null;
+
+/**
+ * Fused QKV projection: computes Q, K, V from input x in a single kernel
+ * Reads input x only once instead of 3 times
+ *
+ * @param x - Input tensor [M, hidden]
+ * @param wQ - Q weight [hidden, qDim]
+ * @param wK - K weight [hidden, kDim]
+ * @param wV - V weight [hidden, vDim]
+ * @returns Object containing Q, K, V tensors
+ */
+export async function fusedQKVProjection(
+  x: Tensor,
+  wQ: Tensor,
+  wK: Tensor,
+  wV: Tensor
+): Promise<{ Q: Tensor; K: Tensor; V: Tensor }> {
+  if (!fusedQKVPipeline) {
+    fusedQKVPipeline = createComputePipelineFromSource(FUSED_QKV_SHADER, {
+      label: 'fused_qkv',
+      entryPoint: 'main',
+    });
+  }
+
+  const M = x.shape[0];
+  const hidden = x.shape[1];
+  const qDim = wQ.shape[1];
+  const kDim = wK.shape[1];
+  const vDim = wV.shape[1];
+
+  const Q = Tensor.empty([M, qDim], { label: 'Q_output' });
+  const K = Tensor.empty([M, kDim], { label: 'K_output' });
+  const V = Tensor.empty([M, vDim], { label: 'V_output' });
+
+  // Pack params: M, hidden, qDim, kDim, vDim, pad, pad, pad
+  const paramsData = new ArrayBuffer(32);
+  const view = new DataView(paramsData);
+  view.setUint32(0, M, true);
+  view.setUint32(4, hidden, true);
+  view.setUint32(8, qDim, true);
+  view.setUint32(12, kDim, true);
+  view.setUint32(16, vDim, true);
+  view.setUint32(20, 0, true);
+  view.setUint32(24, 0, true);
+  view.setUint32(28, 0, true);
+
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'qkv_params');
+
+  const bindGroup = createBindGroup(fusedQKVPipeline, 0, [
+    { binding: 0, resource: x.getBuffer() },
+    { binding: 1, resource: wQ.getBuffer() },
+    { binding: 2, resource: wK.getBuffer() },
+    { binding: 3, resource: wV.getBuffer() },
+    { binding: 4, resource: Q.getBuffer() },
+    { binding: 5, resource: K.getBuffer() },
+    { binding: 6, resource: V.getBuffer() },
+    { binding: 7, resource: params },
+  ]);
+
+  // Workgroups: X covers all output columns (Q+K+V), Y covers M
+  const totalCols = qDim + kDim + vDim;
+  const wgX = Math.ceil(totalCols / 256);
+  const wgY = M;
+
+  const usedBuffers = [
+    x.getBuffer(), wQ.getBuffer(), wK.getBuffer(), wV.getBuffer(),
+    Q.getBuffer(), K.getBuffer(), V.getBuffer(), params
+  ];
+  await executeCompute(fusedQKVPipeline, [bindGroup], [wgX, wgY, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return { Q, K, V };
 }

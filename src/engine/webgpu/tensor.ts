@@ -13,6 +13,7 @@ import {
   getBufferPool,
 } from './buffer.js';
 import { getWebGPUDevice } from './device.js';
+import { requestBufferDestroy } from './shader.js';
 
 export type TensorDType = 'f32' | 'f16' | 'i32' | 'u32';
 
@@ -175,6 +176,7 @@ export class Tensor {
 
   /**
    * Release GPU memory
+   * Uses deferred destruction if buffer is owned by pending commands (TensorFlow.js approach)
    */
   destroy(): void {
     if (this.destroyed) return;
@@ -182,7 +184,8 @@ export class Tensor {
     if (this.pooled) {
       getBufferPool().release(this.buffer);
     } else {
-      this.buffer.destroy();
+      // Request destruction - will be deferred if buffer is in use by pending commands
+      requestBufferDestroy(this.buffer);
     }
     this.destroyed = true;
   }
