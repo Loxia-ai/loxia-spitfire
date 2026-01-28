@@ -45,6 +45,10 @@ class CommandBatcher {
   // Buffers that were requested to be destroyed while commands are pending
   private pendingDisposal: GPUBuffer[] = [];
 
+  // Buffers from the PREVIOUS batch - safe to destroy since GPU has finished with them
+  // GPU processes batches sequentially, so by the time we flush again, the previous batch is done
+  private previousBatchDisposal: GPUBuffer[] = [];
+
   /**
    * Add a command buffer to the pending batch
    * Note: usedBuffers parameter kept for API compatibility but no longer tracked individually
@@ -76,29 +80,63 @@ class CommandBatcher {
 
   /**
    * Flush all pending command buffers to the GPU
+   *
+   * Buffer destruction is deferred by one batch to ensure GPU has finished reading.
+   * When we flush batch N, we destroy buffers from batch N-1 (which is guaranteed
+   * complete since GPU processes sequentially).
    */
   flush(): void {
+    // First, destroy buffers from the PREVIOUS batch (GPU has finished with them)
+    for (const buffer of this.previousBatchDisposal) {
+      buffer.destroy();
+    }
+    this.previousBatchDisposal = [];
+
     if (this.pendingCommandBuffers.length > 0) {
       const gpuDevice = getWebGPUDevice();
       // Submit all command buffers in a single call - this is the key optimization
       gpuDevice.submit(this.pendingCommandBuffers);
       this.totalBatches++;
       this.pendingCommandBuffers = [];
-    }
 
-    // Destroy buffers that were deferred
-    for (const buffer of this.pendingDisposal) {
-      buffer.destroy();
+      // Move current pending disposal to previous batch disposal
+      // These will be destroyed on the NEXT flush, after GPU finishes this batch
+      this.previousBatchDisposal = this.pendingDisposal;
+      this.pendingDisposal = [];
+    } else if (this.pendingDisposal.length > 0) {
+      // No commands submitted, but we have buffers to dispose
+      // Move them to previous batch disposal for next flush
+      this.previousBatchDisposal = this.pendingDisposal;
+      this.pendingDisposal = [];
     }
-    this.pendingDisposal = [];
   }
 
   /**
    * Flush and wait for GPU to complete all work
+   * After sync, all buffers can be safely destroyed
    */
   async flushAndSync(): Promise<void> {
-    this.flush();
+    // Submit any pending commands
+    if (this.pendingCommandBuffers.length > 0) {
+      const gpuDevice = getWebGPUDevice();
+      gpuDevice.submit(this.pendingCommandBuffers);
+      this.totalBatches++;
+      this.pendingCommandBuffers = [];
+    }
+
+    // Wait for GPU to finish all work
     await getWebGPUDevice().sync();
+
+    // Now safe to destroy ALL pending buffers since GPU is done
+    for (const buffer of this.previousBatchDisposal) {
+      buffer.destroy();
+    }
+    this.previousBatchDisposal = [];
+
+    for (const buffer of this.pendingDisposal) {
+      buffer.destroy();
+    }
+    this.pendingDisposal = [];
   }
 
   /**
