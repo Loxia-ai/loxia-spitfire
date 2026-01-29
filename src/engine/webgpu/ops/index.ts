@@ -2313,3 +2313,320 @@ export async function fusedQKVProjection(
   requestBufferDestroy(params);
   return { Q, K, V };
 }
+
+// ============================================================================
+// GPU Top-K Sampling
+// ============================================================================
+
+/**
+ * GPU shader for top-k selection with softmax
+ *
+ * Algorithm:
+ * 1. Each workgroup processes a chunk of the vocabulary
+ * 2. Finds local top-k using parallel reduction
+ * 3. Outputs local top-k values and indices
+ * 4. CPU does final merge of workgroup results (small data)
+ */
+const TOPK_SHADER = `
+struct Params {
+  vocabSize: u32,
+  k: u32,
+  temperature: f32,
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> outValues: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outIndices: array<f32>;  // Using f32 so toArray() works correctly
+@group(0) @binding(3) var<storage, read_write> outMax: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+const WG_SIZE: u32 = 256u;
+const LOCAL_K: u32 = 64u;  // Each workgroup finds top-64
+
+var<workgroup> sharedVals: array<f32, 64>;
+var<workgroup> sharedIdxs: array<f32, 64>;  // Store as f32 for easy readback
+var<workgroup> sharedMax: array<f32, 256>;
+var<workgroup> localK: u32;
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(num_workgroups) numWGs: vec3<u32>
+) {
+  let tid = lid.x;
+  let wgIdx = wid.x;
+  let vocabSize = params.vocabSize;
+  let k = min(params.k, LOCAL_K);
+  let temperature = params.temperature;
+
+  // Each workgroup handles a chunk of vocabulary
+  let chunkSize = (vocabSize + numWGs.x - 1u) / numWGs.x;
+  let chunkStart = wgIdx * chunkSize;
+  let chunkEnd = min(chunkStart + chunkSize, vocabSize);
+
+  // Step 1: Each thread finds its local max and top values
+  var threadMax: f32 = -1.0e38;
+  var threadTopVals: array<f32, 4>;
+  var threadTopIdxs: array<f32, 4>;
+
+  // Initialize thread's top-4
+  for (var i = 0u; i < 4u; i++) {
+    threadTopVals[i] = -1.0e38;
+    threadTopIdxs[i] = 0.0;
+  }
+
+  // Process elements assigned to this thread
+  let elementsPerThread = (chunkEnd - chunkStart + WG_SIZE - 1u) / WG_SIZE;
+  for (var e = 0u; e < elementsPerThread; e++) {
+    let idx = chunkStart + tid + e * WG_SIZE;
+    if (idx < chunkEnd) {
+      let val = logits[idx];
+      threadMax = max(threadMax, val);
+
+      // Insert into thread's top-4 (simple insertion)
+      if (val > threadTopVals[3]) {
+        threadTopVals[3] = val;
+        threadTopIdxs[3] = f32(idx);
+        // Bubble up
+        for (var j = 3u; j > 0u; j--) {
+          if (threadTopVals[j] > threadTopVals[j-1u]) {
+            let tmpV = threadTopVals[j-1u];
+            let tmpI = threadTopIdxs[j-1u];
+            threadTopVals[j-1u] = threadTopVals[j];
+            threadTopIdxs[j-1u] = threadTopIdxs[j];
+            threadTopVals[j] = tmpV;
+            threadTopIdxs[j] = tmpI;
+          }
+        }
+      }
+    }
+  }
+
+  // Step 2: Reduce to find workgroup max
+  sharedMax[tid] = threadMax;
+  workgroupBarrier();
+
+  for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sharedMax[tid] = max(sharedMax[tid], sharedMax[tid + s]);
+    }
+    workgroupBarrier();
+  }
+
+  let wgMax = sharedMax[0];
+
+  // Step 3: Merge thread top-4s into workgroup top-k
+  // Thread 0 initializes shared arrays
+  if (tid == 0u) {
+    localK = 0u;
+    for (var i = 0u; i < LOCAL_K; i++) {
+      sharedVals[i] = -1.0e38;
+      sharedIdxs[i] = 0.0;
+    }
+  }
+  workgroupBarrier();
+
+  // Each thread contributes its top values (sequentially to avoid races)
+  // This is O(threads * 4) but threads = 256, so 1024 iterations total - acceptable
+  for (var t = 0u; t < WG_SIZE; t++) {
+    if (tid == t) {
+      for (var i = 0u; i < 4u; i++) {
+        if (threadTopVals[i] > -1.0e37) {
+          // Find insertion point
+          var insertPos = LOCAL_K;
+          for (var j = 0u; j < LOCAL_K; j++) {
+            if (threadTopVals[i] > sharedVals[j]) {
+              insertPos = j;
+              break;
+            }
+          }
+
+          // Insert if within top-k
+          if (insertPos < k) {
+            // Shift down
+            for (var j = k - 1u; j > insertPos; j--) {
+              sharedVals[j] = sharedVals[j - 1u];
+              sharedIdxs[j] = sharedIdxs[j - 1u];
+            }
+            sharedVals[insertPos] = threadTopVals[i];
+            sharedIdxs[insertPos] = threadTopIdxs[i];
+          }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  // Step 4: Output raw logits (softmax done on CPU after merging workgroups)
+  // This allows correct merging across workgroups by comparing raw logit values
+
+  // Step 5: Write results (raw logits, not probabilities)
+  let outOffset = wgIdx * LOCAL_K;
+  if (tid < k) {
+    outValues[outOffset + tid] = sharedVals[tid];
+    outIndices[outOffset + tid] = sharedIdxs[tid];
+  } else if (tid < LOCAL_K) {
+    outValues[outOffset + tid] = 0.0;
+    outIndices[outOffset + tid] = 0.0;
+  }
+
+  // Write workgroup max (for merging)
+  if (tid == 0u) {
+    outMax[wgIdx] = wgMax;
+  }
+}
+`;
+
+let topKPipeline: GPUComputePipeline | null = null;
+
+export interface TopKResult {
+  probs: Float32Array;
+  indices: Uint32Array;
+}
+
+/**
+ * GPU-accelerated top-k selection with softmax
+ *
+ * @param logits - Logits tensor [1, vocabSize] or [vocabSize]
+ * @param k - Number of top elements to return
+ * @param temperature - Temperature for softmax
+ * @returns Top-k probabilities and their indices
+ */
+export async function topKSoftmaxGPU(
+  logits: Tensor,
+  k: number,
+  temperature: number
+): Promise<TopKResult> {
+  const vocabSize = logits.shape[logits.ndim - 1];
+
+  if (!topKPipeline) {
+    topKPipeline = createComputePipelineFromSource(TOPK_SHADER, {
+      label: 'topk_softmax',
+      entryPoint: 'main',
+    });
+  }
+
+  // Limit k to 64 (LOCAL_K in shader)
+  const effectiveK = Math.min(k, 64);
+
+  // Use multiple workgroups for large vocabularies
+  // Each workgroup finds local top-k, outputs raw logits (not softmax)
+  // CPU merges by raw logit value, then applies softmax
+  const numWorkgroups = Math.min(Math.ceil(vocabSize / 4096), 32);
+  const localK = 64;
+
+  // Create output buffers
+  const outValuesBuffer = createStorageBuffer(numWorkgroups * localK * 4, 'topk_values');
+  const outIndicesBuffer = createStorageBuffer(numWorkgroups * localK * 4, 'topk_indices');
+  const outMaxBuffer = createStorageBuffer(numWorkgroups * 4, 'topk_max');
+
+  // Create params
+  const paramsData = new ArrayBuffer(16);
+  const view = new DataView(paramsData);
+  view.setUint32(0, vocabSize, true);
+  view.setUint32(4, effectiveK, true);
+  view.setFloat32(8, temperature, true);
+  view.setUint32(12, 0, true);
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'topk_params');
+
+  const bindGroup = createBindGroup(topKPipeline, 0, [
+    { binding: 0, resource: logits.getBuffer() },
+    { binding: 1, resource: outValuesBuffer },
+    { binding: 2, resource: outIndicesBuffer },
+    { binding: 3, resource: outMaxBuffer },
+    { binding: 4, resource: params },
+  ]);
+
+  const usedBuffers = [logits.getBuffer(), outValuesBuffer, outIndicesBuffer, outMaxBuffer, params];
+  await executeCompute(topKPipeline, [bindGroup], [numWorkgroups, 1, 1], undefined, false, true, usedBuffers);
+
+  // Read results from GPU (small amount of data)
+  const valuesResult = new Tensor([numWorkgroups * localK], outValuesBuffer, { label: 'topk_values_tensor' });
+  const indicesResult = new Tensor([numWorkgroups * localK], outIndicesBuffer, { label: 'topk_indices_tensor' });
+
+  const allValues = await valuesResult.toArray();
+  const allIndicesFloat = await indicesResult.toArray();
+  // Indices are stored as f32 in shader, convert to integers
+  const allIndices = new Uint32Array(allIndicesFloat.length);
+  for (let i = 0; i < allIndicesFloat.length; i++) {
+    allIndices[i] = allIndicesFloat[i];  // f32 -> u32 truncation
+  }
+
+  valuesResult.destroy();
+  indicesResult.destroy();
+  requestBufferDestroy(params);
+
+  // Collect all candidates from all workgroups (raw logit values)
+  const candidates: Array<{logit: number, idx: number}> = [];
+  for (let wg = 0; wg < numWorkgroups; wg++) {
+    for (let i = 0; i < localK; i++) {
+      const logit = allValues[wg * localK + i];
+      const idx = allIndices[wg * localK + i];
+      // Filter out padding (very negative values)
+      if (logit > -1e30) {
+        candidates.push({ logit, idx });
+      }
+    }
+  }
+
+  // Sort by raw logit value (descending) and take global top-k
+  candidates.sort((a, b) => b.logit - a.logit);
+  const topK = candidates.slice(0, effectiveK);
+
+  // Apply temperature scaling and softmax on CPU
+  // Find max for numerical stability
+  let maxLogit = -Infinity;
+  for (const item of topK) {
+    if (item.logit > maxLogit) maxLogit = item.logit;
+  }
+
+  // Compute exp((logit - max) / temperature) and sum
+  const expValues: number[] = [];
+  let sumExp = 0;
+  for (const item of topK) {
+    const scaled = (item.logit - maxLogit) / temperature;
+    const exp = Math.exp(scaled);
+    expValues.push(exp);
+    sumExp += exp;
+  }
+
+  // Normalize to probabilities
+  const finalProbs = new Float32Array(effectiveK);
+  const finalIndices = new Uint32Array(effectiveK);
+  for (let i = 0; i < topK.length; i++) {
+    finalProbs[i] = expValues[i] / sumExp;
+    finalIndices[i] = topK[i].idx;
+  }
+  // Fill remaining slots with zeros if fewer candidates than k
+  for (let i = topK.length; i < effectiveK; i++) {
+    finalProbs[i] = 0;
+    finalIndices[i] = 0;
+  }
+
+  return { probs: finalProbs, indices: finalIndices };
+}
+
+/**
+ * Sample a token from top-k probabilities
+ */
+export function sampleFromTopK(probs: Float32Array, indices: Uint32Array): number {
+  const rand = Math.random();
+  let cumsum = 0;
+  for (let i = 0; i < probs.length; i++) {
+    cumsum += probs[i];
+    if (rand < cumsum) {
+      return indices[i];
+    }
+  }
+  // Fallback to last element
+  return indices[indices.length - 1];
+}
+
+/**
+ * Reset top-k pipeline (for testing)
+ */
+export function resetTopKPipeline(): void {
+  topKPipeline = null;
+}

@@ -24,6 +24,7 @@ import {
   type LlamaWeights,
   type LlamaLayerWeights,
 } from './webgpu/index.js';
+import { topKSoftmaxGPU, sampleFromTopK } from './webgpu/ops/index.js';
 import { extractArchitecture, getChatTemplate } from '../model/gguf.js';
 import type { GGUFFile, ModelArchitecture } from '../types/model.js';
 import { Tokenizer, parseGGUFWithTokenizer } from '../tokenizer/index.js';
@@ -648,6 +649,134 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
+   * Forward pass returning logits as GPU Tensor (no CPU transfer)
+   * Used for GPU-accelerated sampling to avoid expensive toArray()
+   * Caller is responsible for destroying the returned tensor!
+   */
+  private async forwardTensor(inputIds: number[], useCache = false): Promise<Tensor> {
+    if (!this.weights) {
+      throw new Error('Model weights not loaded');
+    }
+
+    const forwardStart = performance.now();
+    const fullSeqLen = inputIds.length;
+
+    // For cached inference, we only process new tokens
+    let startPos = 0;
+    let tokensToProcess: number[];
+    let isIncremental = false;
+
+    if (useCache && this.kvCache && this.kvCache.seqLen > 0) {
+      isIncremental = true;
+      startPos = this.kvCache.seqLen;
+      tokensToProcess = inputIds.slice(startPos);
+    } else {
+      tokensToProcess = inputIds;
+      if (useCache) {
+        this.clearKVCache();
+        const maxSeqLen = Math.max(this.contextLength, fullSeqLen + 256);
+        this.kvCache = this.createGPUKVCache(maxSeqLen);
+      }
+    }
+
+    const processLen = tokensToProcess.length;
+
+    // Create input embeddings only for tokens we need to process
+    let hidden: Tensor;
+    if (this.weights.tokenEmbedding) {
+      hidden = await ops.embeddingLookup(this.weights.tokenEmbedding, tokensToProcess, this.vocabSize);
+    } else {
+      hidden = Tensor.random([processLen, this.hiddenSize], { label: 'hidden' });
+    }
+
+    // Process through all layers
+    for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
+      const layer = this.weights.layers[layerIdx];
+      if (!layer.attnNorm || !layer.ffnNorm) continue;
+
+      // Pre-attention norm
+      const normed = await rmsNorm(hidden, layer.attnNorm, this.rmsNormEps);
+
+      // Self-attention
+      let attnOut: Tensor;
+      if (layer.attnQ && layer.attnK && layer.attnV && layer.attnOutput) {
+        attnOut = await this.selfAttention(normed, layer, processLen, startPos, layerIdx, useCache);
+      } else {
+        attnOut = normed;
+      }
+
+      // Residual connection
+      const afterAttn = await ops.add(hidden, attnOut);
+      hidden.destroy();
+      if (attnOut !== normed) {
+        normed.destroy();
+        attnOut.destroy();
+      }
+      hidden = afterAttn;
+
+      // Pre-FFN norm
+      const normed2 = await rmsNorm(hidden, layer.ffnNorm, this.rmsNormEps);
+
+      // FFN
+      if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
+        const ffnOut = await feedForwardQ(normed2, layer.ffnGate, layer.ffnUp, layer.ffnDown);
+        const afterFfn = await ops.add(hidden, ffnOut);
+        hidden.destroy();
+        ffnOut.destroy();
+        hidden = afterFfn;
+      }
+      normed2.destroy();
+    }
+
+    // Update KV cache sequence length
+    if (useCache && this.kvCache) {
+      this.kvCache.seqLen = startPos + processLen;
+    }
+
+    // Final norm
+    const normWeight = this.weights.outputNorm || Tensor.ones([this.hiddenSize]);
+    const finalNormed = await rmsNorm(hidden, normWeight, this.rmsNormEps);
+    hidden.destroy();
+    if (!this.weights.outputNorm) normWeight.destroy();
+
+    // Extract last token's hidden state
+    const lastTokenHidden = await ops.sliceLastRow(finalNormed);
+    finalNormed.destroy();
+
+    // Output projection - returns logits Tensor (caller must destroy!)
+    let logits: Tensor;
+    if (this.weights.outputWeight) {
+      logits = await matmulQ(lastTokenHidden, this.weights.outputWeight);
+    } else {
+      logits = Tensor.random([1, this.vocabSize], { label: 'logits' });
+    }
+    lastTokenHidden.destroy();
+
+    const totalTime = performance.now() - forwardStart;
+    if (isIncremental && processLen === 1) {
+      // Light logging for single-token incremental
+    } else {
+      console.log(`[ForwardTensor] ${isIncremental ? 'INCR' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
+    }
+
+    return logits;
+  }
+
+  /**
+   * Sample next token using GPU-accelerated top-k selection
+   * Avoids expensive toArray() by doing top-k and softmax on GPU
+   * Only transfers k values (~160 bytes) instead of full vocab (~512KB)
+   */
+  private async sampleTokenGPU(
+    logits: Tensor,
+    temperature: number,
+    topK: number
+  ): Promise<number> {
+    const result = await topKSoftmaxGPU(logits, topK, temperature);
+    return sampleFromTopK(result.probs, result.indices);
+  }
+
+  /**
    * Forward pass returning logits for multiple positions
    * Used for speculative decoding verification
    *
@@ -1209,11 +1338,13 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
 
       // Fallback: single token generation (no draft match or speculation disabled)
+      // Use GPU-accelerated sampling to avoid expensive toArray() transfer
       const allIds = [...inputIds, ...generatedTokens];
-      const logits = await this.forward(allIds, true);
+      const logitsTensor = await this.forwardTensor(allIds, true);
       forwardPasses++;
 
-      const nextToken = this.sampleToken(logits, temperature, topK);
+      const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+      logitsTensor.destroy();  // Must destroy after GPU sampling
       const shouldStop = appendToken(nextToken);
       tokenCount++;
 
@@ -1341,33 +1472,41 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       for (let i = 0; i < maxTokens; i++) {
         // Use KV cache: first iteration does prefill, subsequent do incremental decode
         const allIds = [...inputIds, ...generatedTokens];
-        const logits = await this.forward(allIds, true);  // true = use KV cache
+        let nextToken: number;
 
-      // Debug: show logits distribution for first 3 tokens
-      if (this.debugMode && i < 3) {
-        let minLogit = Infinity, maxLogit = -Infinity, sum = 0;
-        for (let j = 0; j < logits.length; j++) {
-          if (logits[j] < minLogit) minLogit = logits[j];
-          if (logits[j] > maxLogit) maxLogit = logits[j];
-          sum += logits[j];
+        // Debug mode uses CPU sampling to inspect logits
+        if (this.debugMode) {
+          const logits = await this.forward(allIds, true);
+
+          // Debug: show logits distribution for first 3 tokens
+          if (i < 3) {
+            let minLogit = Infinity, maxLogit = -Infinity, sum = 0;
+            for (let j = 0; j < logits.length; j++) {
+              if (logits[j] < minLogit) minLogit = logits[j];
+              if (logits[j] > maxLogit) maxLogit = logits[j];
+              sum += logits[j];
+            }
+            const mean = sum / logits.length;
+
+            const indexed = Array.from(logits).map((v, idx) => ({ v, idx }));
+            indexed.sort((a, b) => b.v - a.v);
+            const top5 = indexed.slice(0, 5);
+
+            console.log(`[Gen ${i}] Logits: min=${minLogit.toFixed(2)}, max=${maxLogit.toFixed(2)}, mean=${mean.toFixed(4)}`);
+            console.log(`[Gen ${i}] Top 5: ${top5.map(t => `${t.idx}(${t.v.toFixed(2)})`).join(', ')}`);
+            if (this.tokenizer) {
+              console.log(`[Gen ${i}] Top 5 tokens: ${top5.map(t => this.tokenizer!.getToken(t.idx)).join(', ')}`);
+            }
+          }
+          nextToken = this.sampleToken(logits, temperature, topK);
+        } else {
+          // Normal mode: GPU-accelerated sampling (avoids expensive toArray)
+          const logitsTensor = await this.forwardTensor(allIds, true);
+          nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+          logitsTensor.destroy();
         }
-        const mean = sum / logits.length;
 
-        // Find top 5 tokens
-        const indexed = Array.from(logits).map((v, idx) => ({ v, idx }));
-        indexed.sort((a, b) => b.v - a.v);
-        const top5 = indexed.slice(0, 5);
-
-        console.log(`[Gen ${i}] Logits: min=${minLogit.toFixed(2)}, max=${maxLogit.toFixed(2)}, mean=${mean.toFixed(4)}`);
-        console.log(`[Gen ${i}] Top 5: ${top5.map(t => `${t.idx}(${t.v.toFixed(2)})`).join(', ')}`);
-        if (this.tokenizer) {
-          console.log(`[Gen ${i}] Top 5 tokens: ${top5.map(t => this.tokenizer!.getToken(t.idx)).join(', ')}`);
-        }
-      }
-
-      // Sample next token
-      const nextToken = this.sampleToken(logits, temperature, topK);
-      generatedTokens.push(nextToken);
+        generatedTokens.push(nextToken);
 
       // Decode and yield the token
       let tokenText: string;
