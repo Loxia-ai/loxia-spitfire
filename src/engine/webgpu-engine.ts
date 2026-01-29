@@ -25,6 +25,7 @@ import {
   type LlamaLayerWeights,
 } from './webgpu/index.js';
 import { topKSoftmaxGPU, sampleFromTopK } from './webgpu/ops/index.js';
+import { fusedQKVProjectionQ4K } from './webgpu/quant/index.js';
 import { extractArchitecture, getChatTemplate } from '../model/gguf.js';
 import type { GGUFFile, ModelArchitecture } from '../types/model.js';
 import { Tokenizer, parseGGUFWithTokenizer } from '../tokenizer/index.js';
@@ -935,10 +936,33 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       layer.attnV instanceof QuantizedTensor;
 
     if (hasQuantizedQKV) {
-      // Quantized path - separate projections with GEMV
-      q = await matmulQ(x, layer.attnQ!);
-      k = await matmulQ(x, layer.attnK!);
-      vProj = await matmulQ(x, layer.attnV!);
+      // Quantized path
+      const allQ4K =
+        layer.attnQ instanceof QuantizedTensor &&
+        layer.attnK instanceof QuantizedTensor &&
+        layer.attnV instanceof QuantizedTensor;
+
+      // Use fused GEMV only for single-token (M=1) incremental decoding
+      // For prefill (M>1), use separate GEMM operations
+      const M = x.shape[0];
+
+      if (allQ4K && M === 1) {
+        // Fused Q4_K GEMV - single kernel, reads x once
+        const result = await fusedQKVProjectionQ4K(
+          x,
+          layer.attnQ as QuantizedTensor,
+          layer.attnK as QuantizedTensor,
+          layer.attnV as QuantizedTensor
+        );
+        q = result.Q;
+        k = result.K;
+        vProj = result.V;
+      } else {
+        // Prefill (M>1) or mixed quantization - use separate matmuls
+        q = await matmulQ(x, layer.attnQ!);
+        k = await matmulQ(x, layer.attnK!);
+        vProj = await matmulQ(x, layer.attnV!);
+      }
     } else {
       // f32 path - use fused kernel (reads x once)
       const { Q: qRaw, K: kRaw, V: vProjRaw } = await ops.fusedQKVProjection(

@@ -15,7 +15,7 @@ import {
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
-import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemmQ8_0, gemmQ4_K } from '../quant/index.js';
+import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemmQ8_0, gemmQ4_K, fusedFFNGateUpQ4K } from '../quant/index.js';
 import { GGMLType } from '../../../types/model.js';
 
 /**
@@ -597,7 +597,28 @@ export async function feedForwardQ(
     return feedForward(x, wGate as Tensor, wUp as Tensor, wDown as Tensor);
   }
 
-  // Quantized path - separate operations with GEMV
+  // Check if we can use fused kernel (M=1, all Q4_K)
+  const M = x.shape[0];
+  const allQ4K =
+    wGate instanceof QuantizedTensor && wGate.quantType === GGMLType.Q4_K &&
+    wUp instanceof QuantizedTensor && wUp.quantType === GGMLType.Q4_K &&
+    wDown instanceof QuantizedTensor && wDown.quantType === GGMLType.Q4_K;
+
+  if (allQ4K && M === 1) {
+    // Fused path: single kernel computes SiLU(x @ Wgate) * (x @ Wup)
+    const hidden = await fusedFFNGateUpQ4K(
+      x,
+      wGate as QuantizedTensor,
+      wUp as QuantizedTensor
+    );
+
+    // output = hidden @ W_down (still separate)
+    const output = await matmulQ(hidden, wDown);
+    hidden.destroy();
+    return output;
+  }
+
+  // Fallback: separate operations
   const { silu, mul } = await import('../ops/index.js');
 
   // gate = x @ W_gate

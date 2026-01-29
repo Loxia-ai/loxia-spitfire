@@ -29,6 +29,12 @@ export { gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K, resetQGemvPipelines } from './q
 // Re-export optimized quantized GEMV operations (Phase 1: Memory Coalescing)
 export { gemvQ4_K_optimized, resetOptimizedPipelines } from './qgemv-optimized.js';
 
+// Re-export fused QKV projection for quantized weights
+export { fusedQKVProjectionQ4K, resetFusedQKVPipeline } from './fused-qkv.js';
+
+// Re-export fused FFN gate+up for quantized weights
+export { fusedFFNGateUpQ4K, resetFusedFFNPipeline } from './fused-ffn.js';
+
 // ============================================================================
 // Q4_0 Quantization
 // Block size: 32 values per block
