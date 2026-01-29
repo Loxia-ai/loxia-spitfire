@@ -15,6 +15,13 @@ import {
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
+import { QuantizedTensor, gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K } from '../quant/index.js';
+import { GGMLType } from '../../../types/model.js';
+
+/**
+ * Weight tensor type - can be f32 Tensor or quantized
+ */
+export type WeightTensor = Tensor | QuantizedTensor;
 
 // ============================================================================
 // Layer Normalization
@@ -486,6 +493,129 @@ export async function feedForward(
 
   // Down projection
   const output = await matmul(hidden, wDown);
+  hidden.destroy();
+
+  return output;
+}
+
+/**
+ * Matrix multiply that handles both f32 and quantized weights.
+ * For M=1 (single vector), uses optimized GEMV kernels.
+ * For M>1 with quantized weights, throws an error (not yet supported).
+ *
+ * @param x - Input tensor [M, K]
+ * @param w - Weight tensor [K, N] (f32 or quantized)
+ * @returns Output tensor [M, N]
+ */
+// Debug counter for matmulQ
+let matmulQDebugCount = 0;
+
+export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
+  const M = x.shape[0];
+
+  if (w instanceof QuantizedTensor) {
+    // Quantized weight path
+    let result: Tensor;
+    if (M === 1) {
+      // GEMV for single-token inference (decode phase)
+      if (w.quantType === GGMLType.Q8_0) {
+        result = await gemvQ8_0(x, w);
+      } else if (w.quantType === GGMLType.Q4_K) {
+        result = await gemvQ4_K(x, w);
+      } else {
+        throw new Error(
+          `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
+          `Supported: Q8_0, Q4_K`
+        );
+      }
+    } else {
+      // GEMM for batch inference (prefill phase)
+      if (w.quantType === GGMLType.Q8_0) {
+        result = await gemmQ8_0(x, w);
+      } else if (w.quantType === GGMLType.Q4_K) {
+        result = await gemmQ4_K(x, w);
+      } else {
+        throw new Error(
+          `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
+          `Supported: Q8_0, Q4_K`
+        );
+      }
+    }
+
+    // Debug: print stats for first few matmulQ calls
+    if (matmulQDebugCount < 5) {
+      matmulQDebugCount++;
+      const data = await result.toArray();
+      let sum = 0, min = Infinity, max = -Infinity, nanCount = 0;
+      for (let i = 0; i < Math.min(1000, data.length); i++) {
+        if (isNaN(data[i])) { nanCount++; continue; }
+        sum += data[i];
+        if (data[i] < min) min = data[i];
+        if (data[i] > max) max = data[i];
+      }
+      const mean = sum / Math.min(1000, data.length);
+      console.log(`[matmulQ #${matmulQDebugCount}] X:[${x.shape}] @ W:[${w.shape}] -> [${result.shape}], mean=${mean.toFixed(4)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, nans=${nanCount}, first5=[${Array.from(data.slice(0, 5)).map(v => v.toFixed(4)).join(', ')}]`);
+    }
+
+    return result;
+  }
+
+  // f32 Tensor path - use regular matmul
+  return matmul(x, w);
+}
+
+/**
+ * Feed-Forward Network with SiLU activation (Llama-style)
+ * Supports both f32 and quantized weights.
+ *
+ * For f32 weights: uses fused SwiGLU kernel for maximum performance
+ * For quantized weights: uses separate GEMV calls with SiLU activation
+ *
+ * gate = x @ W_gate
+ * up = x @ W_up
+ * output = (silu(gate) * up) @ W_down
+ *
+ * @param x - Input tensor [M, hidden]
+ * @param wGate - Gate weight [hidden, intermediate] (f32 or quantized)
+ * @param wUp - Up weight [hidden, intermediate] (f32 or quantized)
+ * @param wDown - Down weight [intermediate, hidden] (f32 or quantized)
+ */
+export async function feedForwardQ(
+  x: Tensor,
+  wGate: WeightTensor,
+  wUp: WeightTensor,
+  wDown: WeightTensor
+): Promise<Tensor> {
+  // Check if any weight is quantized
+  const hasQuantizedWeights =
+    wGate instanceof QuantizedTensor ||
+    wUp instanceof QuantizedTensor ||
+    wDown instanceof QuantizedTensor;
+
+  if (!hasQuantizedWeights) {
+    // All f32 - use optimized fused path
+    return feedForward(x, wGate as Tensor, wUp as Tensor, wDown as Tensor);
+  }
+
+  // Quantized path - separate operations with GEMV
+  const { silu, mul } = await import('../ops/index.js');
+
+  // gate = x @ W_gate
+  const gate = await matmulQ(x, wGate);
+
+  // up = x @ W_up
+  const up = await matmulQ(x, wUp);
+
+  // activated = silu(gate) * up
+  const gateActivated = await silu(gate);
+  gate.destroy();
+
+  const hidden = await mul(gateActivated, up);
+  gateActivated.destroy();
+  up.destroy();
+
+  // output = hidden @ W_down
+  const output = await matmulQ(hidden, wDown);
   hidden.destroy();
 
   return output;

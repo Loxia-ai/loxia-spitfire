@@ -376,8 +376,10 @@ export async function broadcastAdd(input: Tensor, bias: Tensor): Promise<Tensor>
 // ============================================================================
 
 const MATMUL_SHADER = `
-// Tiled matrix multiplication for better cache performance
+// Tiled matrix multiplication with 32x32 output tiles
 // A: [M, K], B: [K, N], C: [M, N]
+// Workgroup: 16x16 = 256 threads, each computes a 2x2 output block
+// Compute:load ratio = 16:1 (vs 4:1 with 8x8 tiles)
 
 struct Params {
   M: u32,
@@ -391,67 +393,206 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-const TILE_SIZE: u32 = 8u;
+const TILE_MN: u32 = 32u;
+const TILE_K: u32 = 32u;
 
-var<workgroup> tileA: array<array<f32, 8>, 8>;
-var<workgroup> tileB: array<array<f32, 8>, 8>;
+var<workgroup> tileA: array<f32, 1024>;  // 32 * 32
+var<workgroup> tileB: array<f32, 1024>;  // 32 * 32
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(workgroup_id) wid: vec3<u32>
 ) {
-  let row = gid.y;
-  let col = gid.x;
-  let localRow = lid.y;
-  let localCol = lid.x;
+  let tx = lid.x;  // 0..15
+  let ty = lid.y;  // 0..15
+  let tid = ty * 16u + tx;
 
   let M = params.M;
   let N = params.N;
   let K = params.K;
 
-  var sum: f32 = 0.0;
+  // Each thread computes a 2x2 block of outputs
+  let rowBase = wid.y * TILE_MN + ty * 2u;
+  let colBase = wid.x * TILE_MN + tx * 2u;
 
-  let numTiles = (K + TILE_SIZE - 1u) / TILE_SIZE;
+  var s00: f32 = 0.0;
+  var s01: f32 = 0.0;
+  var s10: f32 = 0.0;
+  var s11: f32 = 0.0;
+
+  let numTiles = (K + TILE_K - 1u) / TILE_K;
 
   for (var t = 0u; t < numTiles; t++) {
-    // Load tile from A
-    let aRow = row;
-    let aCol = t * TILE_SIZE + localCol;
-    if (aRow < M && aCol < K) {
-      tileA[localRow][localCol] = A[aRow * K + aCol];
-    } else {
-      tileA[localRow][localCol] = 0.0;
+    let kOffset = t * TILE_K;
+
+    // Cooperative load: 256 threads load 1024 elements (4 per thread)
+    for (var i = tid; i < 1024u; i += 256u) {
+      let tileRow = i / TILE_K;
+      let tileCol = i % TILE_K;
+      let aRow = wid.y * TILE_MN + tileRow;
+      let aCol = kOffset + tileCol;
+      if (aRow < M && aCol < K) {
+        tileA[i] = A[aRow * K + aCol];
+      } else {
+        tileA[i] = 0.0;
+      }
     }
 
-    // Load tile from B
-    let bRow = t * TILE_SIZE + localRow;
-    let bCol = col;
-    if (bRow < K && bCol < N) {
-      tileB[localRow][localCol] = B[bRow * N + bCol];
-    } else {
-      tileB[localRow][localCol] = 0.0;
+    for (var i = tid; i < 1024u; i += 256u) {
+      let tileRow = i / TILE_MN;
+      let tileCol = i % TILE_MN;
+      let bRow = kOffset + tileRow;
+      let bCol = wid.x * TILE_MN + tileCol;
+      if (bRow < K && bCol < N) {
+        tileB[i] = B[bRow * N + bCol];
+      } else {
+        tileB[i] = 0.0;
+      }
     }
 
     workgroupBarrier();
 
-    // Compute partial sum
-    for (var k = 0u; k < TILE_SIZE; k++) {
-      sum += tileA[localRow][k] * tileB[k][localCol];
+    // Accumulate 2x2 block from tile
+    for (var k = 0u; k < TILE_K; k++) {
+      let a0 = tileA[(ty * 2u) * TILE_K + k];
+      let a1 = tileA[(ty * 2u + 1u) * TILE_K + k];
+      let b0 = tileB[k * TILE_MN + tx * 2u];
+      let b1 = tileB[k * TILE_MN + tx * 2u + 1u];
+
+      s00 += a0 * b0;
+      s01 += a0 * b1;
+      s10 += a1 * b0;
+      s11 += a1 * b1;
     }
 
     workgroupBarrier();
   }
 
-  // Write result
-  if (row < M && col < N) {
-    C[row * N + col] = sum;
-  }
+  // Write 2x2 results
+  if (rowBase < M && colBase < N) { C[rowBase * N + colBase] = s00; }
+  if (rowBase < M && (colBase + 1u) < N) { C[rowBase * N + colBase + 1u] = s01; }
+  if ((rowBase + 1u) < M && colBase < N) { C[(rowBase + 1u) * N + colBase] = s10; }
+  if ((rowBase + 1u) < M && (colBase + 1u) < N) { C[(rowBase + 1u) * N + colBase + 1u] = s11; }
 }
 `;
 
 let matmulPipeline: GPUComputePipeline | null = null;
+
+// ---- GEMV: Specialized matrix-vector multiply for M=1 ----
+// When M=1 the input vector A is tiny. Load it entirely into shared memory
+// with ONE barrier, then each thread computes 4 output columns by streaming
+// through B with fully coalesced memory access. No tiling barriers on B,
+// no branch divergence, 256 threads all active.
+
+const GEMV_SHADER = `
+struct Params {
+  N: u32,
+  K: u32,
+  _p1: u32,
+  _p2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+const SHARED_K: u32 = 4096u;
+var<workgroup> sharedA: array<f32, 4096>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let tid = lid.x;
+  let N = params.N;
+  let K = params.K;
+
+  // 4 output columns per thread, 256 threads = 1024 columns per workgroup
+  let baseCol = wid.x * 1024u + tid * 4u;
+
+  let c0Valid = baseCol < N;
+  let c1Valid = (baseCol + 1u) < N;
+  let c2Valid = (baseCol + 2u) < N;
+  let c3Valid = (baseCol + 3u) < N;
+
+  var s0: f32 = 0.0;
+  var s1: f32 = 0.0;
+  var s2: f32 = 0.0;
+  var s3: f32 = 0.0;
+
+  // Tile the K dimension in chunks of 4096
+  let numTilesK = (K + SHARED_K - 1u) / SHARED_K;
+
+  for (var tileK = 0u; tileK < numTilesK; tileK++) {
+    let kStart = tileK * SHARED_K;
+    let kEnd = min(kStart + SHARED_K, K);
+    let tileLen = kEnd - kStart;
+
+    // Cooperative load of A into shared memory
+    for (var i = tid; i < tileLen; i += 256u) {
+      sharedA[i] = A[kStart + i];
+    }
+    workgroupBarrier();
+
+    // Each thread accumulates dot product for its 4 output columns
+    for (var kk = 0u; kk < tileLen; kk++) {
+      let aVal = sharedA[kk];
+      let bBase = (kStart + kk) * N + baseCol;
+      if (c0Valid) { s0 += aVal * B[bBase]; }
+      if (c1Valid) { s1 += aVal * B[bBase + 1u]; }
+      if (c2Valid) { s2 += aVal * B[bBase + 2u]; }
+      if (c3Valid) { s3 += aVal * B[bBase + 3u]; }
+    }
+    workgroupBarrier();
+  }
+
+  if (c0Valid) { C[baseCol] = s0; }
+  if (c1Valid) { C[baseCol + 1u] = s1; }
+  if (c2Valid) { C[baseCol + 2u] = s2; }
+  if (c3Valid) { C[baseCol + 3u] = s3; }
+}
+`;
+
+let gemvPipeline: GPUComputePipeline | null = null;
+
+/**
+ * GEMV: matrix-vector multiply for M=1
+ * A: [1, K], B: [K, N] -> C: [1, N]
+ */
+async function gemv(a: Tensor, b: Tensor): Promise<Tensor> {
+  const [, K] = a.shape;
+  const [, N] = b.shape;
+
+  if (!gemvPipeline) {
+    gemvPipeline = createComputePipelineFromSource(GEMV_SHADER, {
+      label: 'gemv',
+      entryPoint: 'main',
+    });
+  }
+
+  const output = Tensor.empty([1, N], { label: 'gemv_output' });
+
+  const params = createUniformBufferWithData(
+    new Uint32Array([N, K, 0, 0]),
+    'gemv_params'
+  );
+
+  const bindGroup = createBindGroup(gemvPipeline, 0, [
+    { binding: 0, resource: a.getBuffer() },
+    { binding: 1, resource: b.getBuffer() },
+    { binding: 2, resource: output.getBuffer() },
+    { binding: 3, resource: params },
+  ]);
+
+  // 1024 columns per workgroup (256 threads × 4 cols)
+  const wgX = Math.ceil(N / 1024);
+  const usedBuffers = [a.getBuffer(), b.getBuffer(), output.getBuffer(), params];
+  await executeCompute(gemvPipeline, [bindGroup], [wgX, 1, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return output;
+}
 
 /**
  * Matrix multiplication: C = A @ B
@@ -459,10 +600,6 @@ let matmulPipeline: GPUComputePipeline | null = null;
  *
  * Uses specialized GEMV shader when M=1 for much better performance
  * on single-token inference (avoids wasteful 8x8 workgroups).
- */
-/**
- * Matrix multiplication: C = A @ B
- * A: [M, K], B: [K, N] -> C: [M, N]
  */
 export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
   if (a.ndim !== 2 || b.ndim !== 2) {
@@ -476,11 +613,12 @@ export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
     throw new Error(`Inner dimensions must match: ${K1} vs ${K2}`);
   }
 
-  const K = K1;
+  // Use specialized GEMV shader for M=1 (single-token inference)
+  if (M === 1) {
+    return gemv(a, b);
+  }
 
-  // Tiled matmul - works for all M values including M=1
-  // Note: We tested a specialized GEMV shader for M=1 but it had identical
-  // performance due to WebGPU/Dawn overhead dominating computation time
+  // Tiled GEMM for M > 1
   if (!matmulPipeline) {
     matmulPipeline = createComputePipelineFromSource(MATMUL_SHADER, {
       label: 'matmul',
@@ -488,6 +626,7 @@ export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
     });
   }
 
+  const K = K1;
   const output = Tensor.empty([M, N], { label: 'matmul_output' });
 
   const params = createUniformBufferWithData(
@@ -502,7 +641,7 @@ export async function matmul(a: Tensor, b: Tensor): Promise<Tensor> {
     { binding: 3, resource: params },
   ]);
 
-  const [wgX, wgY] = calculateWorkgroups2D(N, M, 8, 8);
+  const [wgX, wgY] = calculateWorkgroups2D(N, M, 32, 32);
   const usedBuffers = [a.getBuffer(), b.getBuffer(), output.getBuffer(), params];
   await executeCompute(matmulPipeline, [bindGroup], [wgX, wgY, 1], undefined, false, true, usedBuffers);
 
@@ -781,6 +920,7 @@ export function resetOpsPipelines(): void {
   binaryPipelines = null;
   scalarPipelines = null;
   matmulPipeline = null;
+  gemvPipeline = null;
   reducePipelines = null;
   softmaxPipeline = null;
   embeddingPipeline = null;
@@ -788,6 +928,8 @@ export function resetOpsPipelines(): void {
   sliceLastRowPipeline = null;
   copyRowsPipeline = null;
   causalAttentionPipeline = null;
+  fusedSwiGLUGemvPipeline = null;
+  fusedQKVGemvPipeline = null;
 }
 
 // ============================================================================
@@ -940,12 +1082,10 @@ export async function embeddingLookup(
 // ============================================================================
 
 const CAUSAL_ATTENTION_SHADER = `
-// Fused causal attention optimized for GPU
+// Fused causal attention with online softmax (Flash-Attention style)
 // Computes: softmax((Q @ K^T) * scale) @ V with causal masking
 // Supports GQA where numKVHeads <= numHeads
-//
-// Strategy: Each thread handles specific OUTPUT dimensions and iterates over all keys
-// This avoids race conditions and allows proper memory coalescing
+// No sequence length limit — processes keys in chunks of 1024
 
 struct Params {
   numQPos: u32,      // Number of query positions to process
@@ -964,14 +1104,14 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-// Shared memory
-var<workgroup> sharedQ: array<f32, 128>;     // Q vector for this head
-var<workgroup> sharedAttn: array<f32, 1024>; // Attention weights (supports up to 1024 keys)
-var<workgroup> sharedTemp: array<f32, 128>;  // Temp for reduction
+// Shared memory (~5.5KB total)
+var<workgroup> sharedQ: array<f32, 128>;       // Q vector (max headDim=128)
+var<workgroup> sharedScores: array<f32, 1024>; // Scores for current chunk
+var<workgroup> sharedTemp: array<f32, 256>;    // Reduction workspace
 var<workgroup> wgMax: f32;
 var<workgroup> wgSum: f32;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn main(
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(workgroup_id) wid: vec3<u32>
@@ -997,91 +1137,142 @@ fn main(
   let validKeys = min(absQPos + 1u, numKeys);
 
   let tid = lid.x;
-  let WG_SIZE = 128u;
+  let WG_SIZE = 256u;
+  let KPT = 4u;        // keys per thread
+  let CHUNK = 1024u;   // WG_SIZE * KPT
 
-  // ===== Step 1: Load Q into shared memory =====
+  // ===== Phase 0: Load Q into shared memory =====
   let qBase = qPos * numHeads * headDim + head * headDim;
   if (tid < headDim) {
     sharedQ[tid] = Q[qBase + tid];
   }
   workgroupBarrier();
 
-  // ===== Step 2: Compute all attention scores Q @ K^T * scale =====
-  // Each thread handles multiple keys
-  var threadMax: f32 = -1.0e+38;
+  // ===== Online softmax running state =====
+  var m_prev: f32 = -1.0e+38;  // running max
+  var l_prev: f32 = 0.0;       // running exp-sum
+  var oAccum: f32 = 0.0;       // per-dimension output (lane 0 threads, tid < headDim)
 
-  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
-    var score: f32 = 0.0;
-    let kBase = ki * numKVHeads * headDim + kvHead * headDim;
-    for (var d = 0u; d < headDim; d++) {
-      score += sharedQ[d] * K[kBase + d];
+  // Process keys in chunks of CHUNK
+  let numChunks = (validKeys + CHUNK - 1u) / CHUNK;
+
+  for (var chunk = 0u; chunk < numChunks; chunk++) {
+    let chunkStart = chunk * CHUNK;
+    let chunkEnd = min(chunkStart + CHUNK, validKeys);
+    let chunkLen = chunkEnd - chunkStart;
+
+    // ===== Phase 1: Compute Q @ K^T scores for this chunk =====
+    // Each thread computes KPT dot products (unrolled for ILP)
+    for (var j = 0u; j < KPT; j++) {
+      let ki = tid * KPT + j;
+      if (ki < chunkLen) {
+        let globalKi = chunkStart + ki;
+        var score: f32 = 0.0;
+        let kBase = globalKi * numKVHeads * headDim + kvHead * headDim;
+        for (var d = 0u; d < headDim; d++) {
+          score += sharedQ[d] * K[kBase + d];
+        }
+        sharedScores[ki] = score * scale;
+      } else if (ki < CHUNK) {
+        sharedScores[ki] = -1.0e+38;
+      }
     }
-    score *= scale;
-    sharedAttn[ki] = score;
-    threadMax = max(threadMax, score);
-  }
+    workgroupBarrier();
 
-  // Reduce to find max
-  sharedTemp[tid] = threadMax;
-  workgroupBarrier();
+    // ===== Phase 2: Max reduction =====
+    var threadMax: f32 = -1.0e+38;
+    for (var j = 0u; j < KPT; j++) {
+      let ki = tid * KPT + j;
+      if (ki < chunkLen) {
+        threadMax = max(threadMax, sharedScores[ki]);
+      }
+    }
+    sharedTemp[tid] = threadMax;
+    workgroupBarrier();
 
-  for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sharedTemp[tid] = max(sharedTemp[tid], sharedTemp[tid + s]);
+    for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+      if (tid < s) {
+        sharedTemp[tid] = max(sharedTemp[tid], sharedTemp[tid + s]);
+      }
+      workgroupBarrier();
+    }
+
+    if (tid == 0u) {
+      wgMax = sharedTemp[0];
+    }
+    workgroupBarrier();
+    let chunkMax = wgMax;
+
+    // ===== Phase 3: Exp + sum, update online softmax state =====
+    let m_new = max(m_prev, chunkMax);
+    let alpha = exp(m_prev - m_new);
+
+    var threadSum: f32 = 0.0;
+    for (var j = 0u; j < KPT; j++) {
+      let ki = tid * KPT + j;
+      if (ki < chunkLen) {
+        let expVal = exp(sharedScores[ki] - m_new);
+        sharedScores[ki] = expVal;
+        threadSum += expVal;
+      } else if (ki < CHUNK) {
+        sharedScores[ki] = 0.0;
+      }
+    }
+    sharedTemp[tid] = threadSum;
+    workgroupBarrier();
+
+    for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+      if (tid < s) {
+        sharedTemp[tid] += sharedTemp[tid + s];
+      }
+      workgroupBarrier();
+    }
+
+    if (tid == 0u) {
+      wgSum = sharedTemp[0];
+    }
+    workgroupBarrier();
+    let chunkSum = wgSum;
+
+    // Update running state
+    l_prev = l_prev * alpha + chunkSum;
+    m_prev = m_new;
+
+    // ===== Phase 4: V accumulation (lane-parallel, all 256 threads active) =====
+    let numLanes = WG_SIZE / headDim;
+    let myDim = tid % headDim;
+    let myLane = tid / headDim;
+
+    // Each lane processes a stripe of keys for dimension myDim
+    var vSum: f32 = 0.0;
+    if (myLane < numLanes) {
+      for (var ki = myLane; ki < chunkLen; ki += numLanes) {
+        let vIdx = (chunkStart + ki) * numKVHeads * headDim + kvHead * headDim + myDim;
+        vSum += sharedScores[ki] * V[vIdx];
+      }
+    }
+    sharedTemp[tid] = vSum;
+    workgroupBarrier();
+
+    // Lane 0 reduces across lanes and applies online correction
+    if (tid < headDim) {
+      var vTotal: f32 = 0.0;
+      for (var lane = 0u; lane < numLanes; lane++) {
+        vTotal += sharedTemp[lane * headDim + tid];
+      }
+      oAccum = oAccum * alpha + vTotal;
     }
     workgroupBarrier();
   }
 
-  if (tid == 0u) {
-    wgMax = sharedTemp[0];
-  }
-  workgroupBarrier();
-  let globalMax = wgMax;
-
-  // ===== Step 3: Compute softmax: exp(score - max) / sum =====
-  var threadSum: f32 = 0.0;
-
-  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
-    let expVal = exp(sharedAttn[ki] - globalMax);
-    sharedAttn[ki] = expVal;
-    threadSum += expVal;
-  }
-
-  // Reduce to find sum
-  sharedTemp[tid] = threadSum;
-  workgroupBarrier();
-
-  for (var s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sharedTemp[tid] += sharedTemp[tid + s];
+  // ===== Final output: oAccum / l_prev =====
+  if (tid < headDim) {
+    let outIdx = qPos * numHeads * headDim + head * headDim + tid;
+    if (l_prev > 0.0) {
+      output[outIdx] = oAccum / l_prev;
+    } else {
+      output[outIdx] = 0.0;
     }
-    workgroupBarrier();
-  }
-
-  if (tid == 0u) {
-    wgSum = sharedTemp[0];
-  }
-  workgroupBarrier();
-  let globalSum = wgSum;
-
-  // Normalize attention weights
-  for (var ki = tid; ki < validKeys; ki += WG_SIZE) {
-    sharedAttn[ki] /= globalSum;
-  }
-  workgroupBarrier();
-
-  // ===== Step 4: Compute output = attn @ V =====
-  // Each thread handles specific output dimensions
-  for (var d = tid; d < headDim; d += WG_SIZE) {
-    var outVal: f32 = 0.0;
-
-    for (var ki = 0u; ki < validKeys; ki++) {
-      let vIdx = ki * numKVHeads * headDim + kvHead * headDim + d;
-      outVal += sharedAttn[ki] * V[vIdx];
-    }
-
-    let outIdx = qPos * numHeads * headDim + head * headDim + d;
-    output[outIdx] = outVal;
   }
 }
 `;
@@ -1582,10 +1773,87 @@ fn main(
 
 let fusedSwiGLUPipeline: GPUComputePipeline | null = null;
 
+// ---- GEMV variant of Fused SwiGLU for M=1 ----
+// Loads entire x vector into shared memory (1 barrier per K tile),
+// each thread computes 4 output columns for both gate and up projections,
+// applies silu(gate) * up inline.
+
+const FUSED_SWIGLU_GEMV_SHADER = `
+struct Params {
+  hidden: u32,
+  intermediate: u32,
+  _p1: u32,
+  _p2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> W_gate: array<f32>;
+@group(0) @binding(2) var<storage, read> W_up: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn silu(val: f32) -> f32 {
+  return val / (1.0 + exp(-val));
+}
+
+const SHARED_K: u32 = 4096u;
+var<workgroup> sharedX: array<f32, 4096>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let tid = lid.x;
+  let hidden = params.hidden;
+  let intermediate = params.intermediate;
+
+  let baseCol = wid.x * 1024u + tid * 4u;
+
+  let c0Valid = baseCol < intermediate;
+  let c1Valid = (baseCol + 1u) < intermediate;
+  let c2Valid = (baseCol + 2u) < intermediate;
+  let c3Valid = (baseCol + 3u) < intermediate;
+
+  var g0: f32 = 0.0; var g1: f32 = 0.0; var g2: f32 = 0.0; var g3: f32 = 0.0;
+  var u0: f32 = 0.0; var u1: f32 = 0.0; var u2: f32 = 0.0; var u3: f32 = 0.0;
+
+  let numTilesK = (hidden + SHARED_K - 1u) / SHARED_K;
+
+  for (var tileK = 0u; tileK < numTilesK; tileK++) {
+    let kStart = tileK * SHARED_K;
+    let kEnd = min(kStart + SHARED_K, hidden);
+    let tileLen = kEnd - kStart;
+
+    for (var i = tid; i < tileLen; i += 256u) {
+      sharedX[i] = x[kStart + i];
+    }
+    workgroupBarrier();
+
+    for (var kk = 0u; kk < tileLen; kk++) {
+      let xVal = sharedX[kk];
+      let wBase = (kStart + kk) * intermediate + baseCol;
+      if (c0Valid) { g0 += xVal * W_gate[wBase];     u0 += xVal * W_up[wBase]; }
+      if (c1Valid) { g1 += xVal * W_gate[wBase + 1u]; u1 += xVal * W_up[wBase + 1u]; }
+      if (c2Valid) { g2 += xVal * W_gate[wBase + 2u]; u2 += xVal * W_up[wBase + 2u]; }
+      if (c3Valid) { g3 += xVal * W_gate[wBase + 3u]; u3 += xVal * W_up[wBase + 3u]; }
+    }
+    workgroupBarrier();
+  }
+
+  if (c0Valid) { output[baseCol]      = silu(g0) * u0; }
+  if (c1Valid) { output[baseCol + 1u] = silu(g1) * u1; }
+  if (c2Valid) { output[baseCol + 2u] = silu(g2) * u2; }
+  if (c3Valid) { output[baseCol + 3u] = silu(g3) * u3; }
+}
+`;
+
+let fusedSwiGLUGemvPipeline: GPUComputePipeline | null = null;
+
 /**
  * Fused SwiGLU: silu(x @ W_gate) * (x @ W_up)
  * Reads input x only once and fuses activation with multiply
  * Reduces 4 kernel calls to 1
+ *
+ * Uses GEMV variant when M=1 for single-token inference.
  *
  * @param x - Input tensor [M, hidden]
  * @param wGate - Gate weight [hidden, intermediate]
@@ -1597,16 +1865,49 @@ export async function fusedSwiGLU(
   wGate: Tensor,
   wUp: Tensor
 ): Promise<Tensor> {
+  const M = x.shape[0];
+  const hidden = x.shape[1];
+  const intermediate = wGate.shape[1];
+
+  // GEMV fast path for M=1 (single-token inference)
+  if (M === 1) {
+    if (!fusedSwiGLUGemvPipeline) {
+      fusedSwiGLUGemvPipeline = createComputePipelineFromSource(FUSED_SWIGLU_GEMV_SHADER, {
+        label: 'fused_swiglu_gemv',
+        entryPoint: 'main',
+      });
+    }
+
+    const output = Tensor.empty([1, intermediate], { label: 'swiglu_gemv_output' });
+
+    const params = createUniformBufferWithData(
+      new Uint32Array([hidden, intermediate, 0, 0]),
+      'swiglu_gemv_params'
+    );
+
+    const bindGroup = createBindGroup(fusedSwiGLUGemvPipeline, 0, [
+      { binding: 0, resource: x.getBuffer() },
+      { binding: 1, resource: wGate.getBuffer() },
+      { binding: 2, resource: wUp.getBuffer() },
+      { binding: 3, resource: output.getBuffer() },
+      { binding: 4, resource: params },
+    ]);
+
+    const wgX = Math.ceil(intermediate / 1024);
+    const usedBuffers = [x.getBuffer(), wGate.getBuffer(), wUp.getBuffer(), output.getBuffer(), params];
+    await executeCompute(fusedSwiGLUGemvPipeline, [bindGroup], [wgX, 1, 1], undefined, false, true, usedBuffers);
+
+    requestBufferDestroy(params);
+    return output;
+  }
+
+  // Tiled GEMM path for M > 1
   if (!fusedSwiGLUPipeline) {
     fusedSwiGLUPipeline = createComputePipelineFromSource(FUSED_SWIGLU_SHADER, {
       label: 'fused_swiglu',
       entryPoint: 'main',
     });
   }
-
-  const M = x.shape[0];
-  const hidden = x.shape[1];
-  const intermediate = wGate.shape[1];
 
   const output = Tensor.empty([M, intermediate], { label: 'swiglu_output' });
 
@@ -1764,9 +2065,131 @@ fn main(
 
 let fusedQKVPipeline: GPUComputePipeline | null = null;
 
+// ---- GEMV variant of Fused QKV Projection for M=1 ----
+// Loads entire x vector into shared memory (1 barrier per K tile),
+// each thread computes 4 output columns across the combined Q+K+V space.
+// Determines target weight matrix by column range — no inner-loop branching
+// since LLM dimensions are always multiples of headDim (>=64).
+
+const FUSED_QKV_GEMV_SHADER = `
+struct Params {
+  hidden: u32,
+  qDim: u32,
+  kDim: u32,
+  vDim: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> Wq: array<f32>;
+@group(0) @binding(2) var<storage, read> Wk: array<f32>;
+@group(0) @binding(3) var<storage, read> Wv: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(5) var<storage, read_write> K: array<f32>;
+@group(0) @binding(6) var<storage, read_write> V: array<f32>;
+@group(0) @binding(7) var<uniform> params: Params;
+
+const SHARED_K: u32 = 4096u;
+var<workgroup> sharedX: array<f32, 4096>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let tid = lid.x;
+  let hidden = params.hidden;
+  let qDim = params.qDim;
+  let kDim = params.kDim;
+  let vDim = params.vDim;
+  let totalCols = qDim + kDim + vDim;
+
+  let baseCol = wid.x * 1024u + tid * 4u;
+
+  let c0Valid = baseCol < totalCols;
+  let c1Valid = (baseCol + 1u) < totalCols;
+  let c2Valid = (baseCol + 2u) < totalCols;
+  let c3Valid = (baseCol + 3u) < totalCols;
+
+  // Determine target matrix and local column for baseCol.
+  // All 4 cols are in the same matrix (dims are multiples of headDim >= 64).
+  var targetMatrix: u32 = 0u;
+  var localCol: u32 = baseCol;
+  var matDim: u32 = qDim;
+  if (baseCol >= qDim + kDim) {
+    targetMatrix = 2u;
+    localCol = baseCol - qDim - kDim;
+    matDim = vDim;
+  } else if (baseCol >= qDim) {
+    targetMatrix = 1u;
+    localCol = baseCol - qDim;
+    matDim = kDim;
+  }
+
+  var a0: f32 = 0.0; var a1: f32 = 0.0; var a2: f32 = 0.0; var a3: f32 = 0.0;
+
+  let numTilesK = (hidden + SHARED_K - 1u) / SHARED_K;
+
+  for (var tileK = 0u; tileK < numTilesK; tileK++) {
+    let kStart = tileK * SHARED_K;
+    let kEnd = min(kStart + SHARED_K, hidden);
+    let tileLen = kEnd - kStart;
+
+    for (var i = tid; i < tileLen; i += 256u) {
+      sharedX[i] = x[kStart + i];
+    }
+    workgroupBarrier();
+
+    if (c0Valid) {
+      for (var kk = 0u; kk < tileLen; kk++) {
+        let xVal = sharedX[kk];
+        let wIdx = (kStart + kk) * matDim + localCol;
+
+        if (targetMatrix == 0u) {
+          a0 += xVal * Wq[wIdx];
+          if (c1Valid) { a1 += xVal * Wq[wIdx + 1u]; }
+          if (c2Valid) { a2 += xVal * Wq[wIdx + 2u]; }
+          if (c3Valid) { a3 += xVal * Wq[wIdx + 3u]; }
+        } else if (targetMatrix == 1u) {
+          a0 += xVal * Wk[wIdx];
+          if (c1Valid) { a1 += xVal * Wk[wIdx + 1u]; }
+          if (c2Valid) { a2 += xVal * Wk[wIdx + 2u]; }
+          if (c3Valid) { a3 += xVal * Wk[wIdx + 3u]; }
+        } else {
+          a0 += xVal * Wv[wIdx];
+          if (c1Valid) { a1 += xVal * Wv[wIdx + 1u]; }
+          if (c2Valid) { a2 += xVal * Wv[wIdx + 2u]; }
+          if (c3Valid) { a3 += xVal * Wv[wIdx + 3u]; }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  // Write to appropriate output buffer
+  if (targetMatrix == 0u) {
+    if (c0Valid) { Q[localCol] = a0; }
+    if (c1Valid) { Q[localCol + 1u] = a1; }
+    if (c2Valid) { Q[localCol + 2u] = a2; }
+    if (c3Valid) { Q[localCol + 3u] = a3; }
+  } else if (targetMatrix == 1u) {
+    if (c0Valid) { K[localCol] = a0; }
+    if (c1Valid) { K[localCol + 1u] = a1; }
+    if (c2Valid) { K[localCol + 2u] = a2; }
+    if (c3Valid) { K[localCol + 3u] = a3; }
+  } else {
+    if (c0Valid) { V[localCol] = a0; }
+    if (c1Valid) { V[localCol + 1u] = a1; }
+    if (c2Valid) { V[localCol + 2u] = a2; }
+    if (c3Valid) { V[localCol + 3u] = a3; }
+  }
+}
+`;
+
+let fusedQKVGemvPipeline: GPUComputePipeline | null = null;
+
 /**
  * Fused QKV projection: computes Q, K, V from input x in a single kernel
  * Reads input x only once instead of 3 times
+ *
+ * Uses GEMV variant when M=1 for single-token inference.
  *
  * @param x - Input tensor [M, hidden]
  * @param wQ - Q weight [hidden, qDim]
@@ -1780,18 +2203,61 @@ export async function fusedQKVProjection(
   wK: Tensor,
   wV: Tensor
 ): Promise<{ Q: Tensor; K: Tensor; V: Tensor }> {
+  const M = x.shape[0];
+  const hidden = x.shape[1];
+  const qDim = wQ.shape[1];
+  const kDim = wK.shape[1];
+  const vDim = wV.shape[1];
+
+  // GEMV fast path for M=1 (single-token inference)
+  if (M === 1) {
+    if (!fusedQKVGemvPipeline) {
+      fusedQKVGemvPipeline = createComputePipelineFromSource(FUSED_QKV_GEMV_SHADER, {
+        label: 'fused_qkv_gemv',
+        entryPoint: 'main',
+      });
+    }
+
+    const Q = Tensor.empty([1, qDim], { label: 'Q_gemv_output' });
+    const K = Tensor.empty([1, kDim], { label: 'K_gemv_output' });
+    const V = Tensor.empty([1, vDim], { label: 'V_gemv_output' });
+
+    const params = createUniformBufferWithData(
+      new Uint32Array([hidden, qDim, kDim, vDim]),
+      'qkv_gemv_params'
+    );
+
+    const bindGroup = createBindGroup(fusedQKVGemvPipeline, 0, [
+      { binding: 0, resource: x.getBuffer() },
+      { binding: 1, resource: wQ.getBuffer() },
+      { binding: 2, resource: wK.getBuffer() },
+      { binding: 3, resource: wV.getBuffer() },
+      { binding: 4, resource: Q.getBuffer() },
+      { binding: 5, resource: K.getBuffer() },
+      { binding: 6, resource: V.getBuffer() },
+      { binding: 7, resource: params },
+    ]);
+
+    const totalCols = qDim + kDim + vDim;
+    const wgX = Math.ceil(totalCols / 1024);
+
+    const usedBuffers = [
+      x.getBuffer(), wQ.getBuffer(), wK.getBuffer(), wV.getBuffer(),
+      Q.getBuffer(), K.getBuffer(), V.getBuffer(), params
+    ];
+    await executeCompute(fusedQKVGemvPipeline, [bindGroup], [wgX, 1, 1], undefined, false, true, usedBuffers);
+
+    requestBufferDestroy(params);
+    return { Q, K, V };
+  }
+
+  // Tiled GEMM path for M > 1
   if (!fusedQKVPipeline) {
     fusedQKVPipeline = createComputePipelineFromSource(FUSED_QKV_SHADER, {
       label: 'fused_qkv',
       entryPoint: 'main',
     });
   }
-
-  const M = x.shape[0];
-  const hidden = x.shape[1];
-  const qDim = wQ.shape[1];
-  const kDim = wK.shape[1];
-  const vDim = wV.shape[1];
 
   const Q = Tensor.empty([M, qDim], { label: 'Q_output' });
   const K = Tensor.empty([M, kDim], { label: 'K_output' });

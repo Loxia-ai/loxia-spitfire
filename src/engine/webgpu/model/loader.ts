@@ -10,6 +10,7 @@ import {
   getBytesPerBlock,
   getBlockSize,
   requiresDequantization,
+  QuantizedTensor,
 } from '../quant/index.js';
 import { transpose } from '../ops/index.js';
 import type { GGUFFile, GGUFTensorInfo, GGMLType } from '../../../types/model.js';
@@ -19,13 +20,24 @@ import { GGMLType as GGMLTypeEnum } from '../../../types/model.js';
  * Options for loading tensors
  */
 export interface TensorLoadOptions {
-  /** Whether to dequantize quantized tensors to f32 */
+  /** Whether to dequantize quantized tensors to f32 (default: true) */
   dequantize?: boolean;
+  /**
+   * Keep weights in quantized format on GPU (for supported types: Q8_0, Q4_0, Q4_K).
+   * When true, returns QuantizedTensor instead of dequantizing to f32.
+   * This saves VRAM but requires using quantized GEMV for computation.
+   */
+  keepQuantized?: boolean;
   /** Maximum number of elements to load (for memory limits) */
   maxElements?: number;
   /** Labels to use for GPU tensors */
   label?: string;
 }
+
+/**
+ * A weight that can be either f32 Tensor or quantized
+ */
+export type WeightTensor = Tensor | QuantizedTensor;
 
 /**
  * Information about a loaded tensor
@@ -35,6 +47,17 @@ export interface LoadedTensor {
   tensor: Tensor;
   originalType: GGMLType;
   shape: number[];
+}
+
+/**
+ * Information about a loaded weight (may be quantized)
+ */
+export interface LoadedWeight {
+  name: string;
+  weight: WeightTensor;
+  originalType: GGMLType;
+  shape: number[];
+  isQuantized: boolean;
 }
 
 /**
@@ -150,6 +173,83 @@ export async function loadTensor(
     tensor,
     originalType: tensorInfo.type,
     shape,
+  };
+}
+
+/**
+ * Load a weight tensor, optionally keeping it in quantized format.
+ *
+ * For supported quantization types (Q8_0, Q4_0, Q4_K), this stores
+ * the raw quantized bytes on GPU instead of dequantizing to f32.
+ * This reduces VRAM usage by 4-8x but requires quantized GEMV for computation.
+ *
+ * Note: The shape returned is the GGUF shape interpreted as row-major,
+ * which is [cols, rows] for 2D tensors. The quantized GEMV handles this
+ * transposed layout directly.
+ */
+export async function loadWeight(
+  handle: FileHandle,
+  tensorInfo: GGUFTensorInfo,
+  tensorDataOffset: bigint,
+  options: TensorLoadOptions = {}
+): Promise<LoadedWeight> {
+  const { keepQuantized = false, label } = options;
+
+  // Calculate dimensions
+  const ggufShape = tensorInfo.dimensions.map(Number);
+  const numBytes = calculateTensorBytes(tensorInfo);
+
+  // Check if we should keep this tensor quantized
+  const canKeepQuantized = keepQuantized && QuantizedTensor.isSupported(tensorInfo.type);
+
+  // GGUF stores 2D weight tensors with shape [ne0, ne1] = [K, N] where:
+  //   ne0 = input dimension (K), which is the contiguous/stride-1 dimension
+  //   ne1 = output dimension (N)
+  // This matches what we need for matmul x @ W where x is [M, K] and W is [K, N].
+  //
+  // For QUANTIZED tensors: keep original GGUF shape [K, N].
+  //   The shader uses linearIdx = n * K + k to match GGUF's storage order.
+  //
+  // For F32 tensors: swap to [N, K] then transpose later to get proper [K, N] layout.
+  //   (The dequantization + transpose path needs the swap.)
+  const shape = (ggufShape.length === 2 && !canKeepQuantized)
+    ? [ggufShape[1], ggufShape[0]]
+    : ggufShape;
+
+  // Read raw tensor data from file
+  const buffer = Buffer.alloc(numBytes);
+  const fileOffset = Number(tensorDataOffset) + Number(tensorInfo.offset);
+  await handle.read(buffer, 0, numBytes, fileOffset);
+  const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.length);
+
+  if (canKeepQuantized) {
+    // Store as QuantizedTensor (no dequantization!)
+    // Shape is [K, N] where K = input dim, N = output dim (same as GGUF [ne0, ne1])
+    const quantTensor = QuantizedTensor.fromQuantizedData(
+      data,
+      shape,
+      tensorInfo.type as Parameters<typeof QuantizedTensor.fromQuantizedData>[2],
+      { label: label || tensorInfo.name }
+    );
+
+    return {
+      name: tensorInfo.name,
+      weight: quantTensor,
+      originalType: tensorInfo.type,
+      shape,
+      isQuantized: true,
+    };
+  }
+
+  // Fall back to dequantizing (original behavior)
+  const loaded = await loadTensor(handle, tensorInfo, tensorDataOffset, options);
+
+  return {
+    name: loaded.name,
+    weight: loaded.tensor,
+    originalType: loaded.originalType,
+    shape: loaded.shape,
+    isQuantized: false,
   };
 }
 
@@ -298,27 +398,39 @@ export function groupTensorsByLayer(
 
 /**
  * Model weights organizer for Llama-style models
+ *
+ * Large projection weights (attnQ/K/V/Output, ffnGate/Up/Down, outputWeight)
+ * can be either f32 Tensor or QuantizedTensor depending on load options.
+ *
+ * Small weights (norms, biases, embeddings) are always kept as f32 Tensor.
  */
 export interface LlamaWeights {
   tokenEmbedding: Tensor | null;
   layers: LlamaLayerWeights[];
   outputNorm: Tensor | null;
-  outputWeight: Tensor | null;
+  outputWeight: WeightTensor | null;  // Can be quantized
 }
 
 export interface LlamaLayerWeights {
+  // Norms are always f32 (small, 1D)
   attnNorm: Tensor | null;
-  attnQ: Tensor | null;
-  attnQBias: Tensor | null;
-  attnK: Tensor | null;
-  attnKBias: Tensor | null;
-  attnV: Tensor | null;
-  attnVBias: Tensor | null;
-  attnOutput: Tensor | null;
   ffnNorm: Tensor | null;
-  ffnGate: Tensor | null;
-  ffnUp: Tensor | null;
-  ffnDown: Tensor | null;
+
+  // Attention projections (can be quantized)
+  attnQ: WeightTensor | null;
+  attnK: WeightTensor | null;
+  attnV: WeightTensor | null;
+  attnOutput: WeightTensor | null;
+
+  // Biases are always f32 (small, often not present)
+  attnQBias: Tensor | null;
+  attnKBias: Tensor | null;
+  attnVBias: Tensor | null;
+
+  // FFN projections (can be quantized - these are the largest!)
+  ffnGate: WeightTensor | null;
+  ffnUp: WeightTensor | null;
+  ffnDown: WeightTensor | null;
 }
 
 /**
@@ -346,40 +458,63 @@ export async function loadLlamaWeights(
       outputWeight: null,
     };
 
-    // Helper to load a tensor by name pattern
-    const loadByPattern = async (
-      patterns: string[]
-    ): Promise<Tensor | null> => {
+    // Helper to find tensor info by name pattern
+    const findByPattern = (patterns: string[]): GGUFTensorInfo | null => {
       for (const pattern of patterns) {
-        const info = ggufFile.tensors.find((t) =>
-          t.name.includes(pattern)
-        );
-        if (info) {
-          const loaded = await loadTensor(
-            handle,
-            info,
-            ggufFile.tensorDataOffset,
-            options
-          );
-          return loaded.tensor;
-        }
+        const info = ggufFile.tensors.find((t) => t.name.includes(pattern));
+        if (info) return info;
       }
       return null;
     };
 
-    // Helper to load and transpose a 2D weight tensor
-    // GGUF column-major [ne0, ne1] becomes row-major [ne1, ne0]
-    // For matmul x @ W, we need W in [in_features, out_features] format
-    const loadAndTransposeWeight = async (
+    // Helper to load a tensor by name pattern (always f32)
+    const loadByPattern = async (
       patterns: string[]
     ): Promise<Tensor | null> => {
-      const tensor = await loadByPattern(patterns);
-      if (tensor && tensor.ndim === 2) {
-        const transposed = await transpose(tensor);
-        tensor.destroy();
-        return transposed;
+      const info = findByPattern(patterns);
+      if (info) {
+        const loaded = await loadTensor(
+          handle,
+          info,
+          ggufFile.tensorDataOffset,
+          { ...options, keepQuantized: false }
+        );
+        return loaded.tensor;
       }
-      return tensor;
+      return null;
+    };
+
+    // Helper to load weight tensor - may be quantized or f32+transposed
+    const loadWeightByPattern = async (
+      patterns: string[]
+    ): Promise<WeightTensor | null> => {
+      const info = findByPattern(patterns);
+      if (!info) return null;
+
+      if (options.keepQuantized && QuantizedTensor.isSupported(info.type)) {
+        // Load as QuantizedTensor (no transpose)
+        const loaded = await loadWeight(
+          handle,
+          info,
+          ggufFile.tensorDataOffset,
+          { ...options, keepQuantized: true }
+        );
+        return loaded.weight;
+      } else {
+        // Load as f32 and transpose
+        const loaded = await loadTensor(
+          handle,
+          info,
+          ggufFile.tensorDataOffset,
+          options
+        );
+        if (loaded.tensor.ndim === 2) {
+          const transposed = await transpose(loaded.tensor);
+          loaded.tensor.destroy();
+          return transposed;
+        }
+        return loaded.tensor;
+      }
     };
 
     // Load embedding (keep original format - embedding lookup handles it)
@@ -414,17 +549,16 @@ export async function loadLlamaWeights(
       'model.norm.weight',
     ]);
 
-    // Load output weight and transpose for matmul
-    weights.outputWeight = await loadAndTransposeWeight([
+    // Load output weight (may be quantized or f32+transposed)
+    weights.outputWeight = await loadWeightByPattern([
       'output.weight',
       'lm_head.weight',
     ]);
 
-    // Debug: check output weight statistics (Q6_K tensor)
-    if (weights.outputWeight) {
+    // Debug: check output weight statistics (only for f32 Tensor)
+    if (weights.outputWeight && weights.outputWeight instanceof Tensor) {
       const outData = await weights.outputWeight.toArray();
       let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
-      // Sample first 100k elements to avoid slowdown
       const sampleSize = Math.min(100000, outData.length);
       for (let j = 0; j < sampleSize; j++) {
         sum += outData[j];
@@ -434,9 +568,13 @@ export async function loadLlamaWeights(
       }
       const mean = sum / sampleSize;
       const variance = sumSq / sampleSize - mean * mean;
-      console.log(`[Output Weight] shape=[${weights.outputWeight.shape.join(', ')}]`);
+      console.log(`[Output Weight] shape=[${weights.outputWeight.shape.join(', ')}] (f32)`);
       console.log(`  mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
-      console.log(`  first 8 vals: [${Array.from(outData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+    } else if (weights.outputWeight) {
+      const qt = weights.outputWeight as QuantizedTensor;
+      const stats = qt.getMemoryStats();
+      console.log(`[Output Weight] shape=[${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+      console.log(`  ${(stats.quantizedBytes / 1024 / 1024).toFixed(1)} MB quantized, ${stats.compressionRatio.toFixed(1)}x compression`);
     }
 
     // Load layer weights
@@ -477,9 +615,8 @@ export async function loadLlamaWeights(
         }
       }
 
-      const loadLayerTensor = async (
-        suffixes: string[]
-      ): Promise<Tensor | null> => {
+      // Helper to find tensor info by suffix patterns
+      const findTensorInfo = (suffixes: string[]): GGUFTensorInfo | null => {
         for (const suffix of suffixes) {
           const name = `${layerPrefix}.${suffix}`;
           const altName = `${altPrefix}.${suffix}`;
@@ -495,31 +632,59 @@ export async function loadLlamaWeights(
                 suffixes.some((s) => t.name.includes(s))
             );
           }
-
-          if (info) {
-            const loaded = await loadTensor(
-              handle,
-              info,
-              ggufFile.tensorDataOffset,
-              options
-            );
-            return loaded.tensor;
-          }
+          if (info) return info;
         }
         return null;
       };
 
-      // Helper to load and transpose layer weights
-      const loadLayerWeight = async (
+      // Load a tensor (always dequantized to f32) - for norms and biases
+      const loadLayerTensor = async (
         suffixes: string[]
       ): Promise<Tensor | null> => {
-        const tensor = await loadLayerTensor(suffixes);
-        if (tensor && tensor.ndim === 2) {
-          const transposed = await transpose(tensor);
-          tensor.destroy();
-          return transposed;
+        const info = findTensorInfo(suffixes);
+        if (info) {
+          const loaded = await loadTensor(
+            handle,
+            info,
+            ggufFile.tensorDataOffset,
+            { ...options, keepQuantized: false }  // Force f32 for small tensors
+          );
+          return loaded.tensor;
         }
-        return tensor;
+        return null;
+      };
+
+      // Helper to load weight matrices - may be quantized or f32+transposed
+      const loadLayerWeight = async (
+        suffixes: string[]
+      ): Promise<WeightTensor | null> => {
+        const info = findTensorInfo(suffixes);
+        if (!info) return null;
+
+        if (options.keepQuantized && QuantizedTensor.isSupported(info.type)) {
+          // Load as QuantizedTensor (no transpose - GEMV handles the layout)
+          const loaded = await loadWeight(
+            handle,
+            info,
+            ggufFile.tensorDataOffset,
+            { ...options, keepQuantized: true }
+          );
+          return loaded.weight;
+        } else {
+          // Load as f32 and transpose for standard matmul
+          const loaded = await loadTensor(
+            handle,
+            info,
+            ggufFile.tensorDataOffset,
+            options
+          );
+          if (loaded.tensor.ndim === 2) {
+            const transposed = await transpose(loaded.tensor);
+            loaded.tensor.destroy();
+            return transposed;
+          }
+          return loaded.tensor;
+        }
       };
 
       // Norm weights are 1D, no transpose needed
@@ -541,15 +706,18 @@ export async function loadLlamaWeights(
 
       // Debug: print GGUF dimensions vs final shape for layer 0
       if (i === 0) {
-        const printShape = async (name: string, tensor: Tensor | null, patterns: string[]) => {
-          if (!tensor) return;
+        const printShape = async (name: string, weight: WeightTensor | null, patterns: string[]) => {
+          if (!weight) return;
+          const isQuant = weight instanceof QuantizedTensor;
+          const shape = weight.shape;
           // Find original GGUF tensor info
           for (const pattern of patterns) {
             const info = ggufFile.tensors.find(t =>
               t.name.includes(`blk.0`) && t.name.includes(pattern.split('.')[0])
             );
             if (info) {
-              console.log(`  ${name}: GGUF dims=[${info.dimensions.join(', ')}] -> final shape=[${tensor.shape.join(', ')}]`);
+              const typeSuffix = isQuant ? ` (${QuantizedTensor.getTypeName((weight as QuantizedTensor).quantType)})` : ' (f32)';
+              console.log(`  ${name}: GGUF dims=[${info.dimensions.join(', ')}] -> final shape=[${shape.join(', ')}]${typeSuffix}`);
               break;
             }
           }
@@ -567,7 +735,8 @@ export async function loadLlamaWeights(
       // Debug: print weight shapes and statistics for layer 0
       if (i === 0) {
         console.log(`[Layer 0] Weight shapes and statistics:`);
-        if (layer.attnQ) {
+        // Only print detailed stats for f32 tensors (not quantized)
+        if (layer.attnQ && layer.attnQ instanceof Tensor) {
           const qData = await layer.attnQ.toArray();
           let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
           for (let j = 0; j < qData.length; j++) {
@@ -578,7 +747,7 @@ export async function loadLlamaWeights(
           }
           const mean = sum / qData.length;
           const variance = sumSq / qData.length - mean * mean;
-          console.log(`  attnQ: [${layer.attnQ.shape.join(', ')}]`);
+          console.log(`  attnQ: [${layer.attnQ.shape.join(', ')}] (f32)`);
           console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
           console.log(`    first row (8 vals): [${Array.from(qData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
           // Also print column sum for first column
@@ -587,8 +756,13 @@ export async function loadLlamaWeights(
             col0Sum += qData[r * layer.attnQ.shape[1]];
           }
           console.log(`    column 0 sum: ${col0Sum.toFixed(4)}`);
+        } else if (layer.attnQ && layer.attnQ instanceof QuantizedTensor) {
+          const qt = layer.attnQ;
+          const stats = qt.getMemoryStats();
+          console.log(`  attnQ: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
-        if (layer.attnK) {
+        if (layer.attnK && layer.attnK instanceof Tensor) {
           const kData = await layer.attnK.toArray();
           let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
           for (let j = 0; j < kData.length; j++) {
@@ -599,11 +773,16 @@ export async function loadLlamaWeights(
           }
           const mean = sum / kData.length;
           const variance = sumSq / kData.length - mean * mean;
-          console.log(`  attnK: [${layer.attnK.shape.join(', ')}]`);
+          console.log(`  attnK: [${layer.attnK.shape.join(', ')}] (f32)`);
           console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
           console.log(`    first 8: [${Array.from(kData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+        } else if (layer.attnK && layer.attnK instanceof QuantizedTensor) {
+          const qt = layer.attnK;
+          const stats = qt.getMemoryStats();
+          console.log(`  attnK: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
-        if (layer.attnV) {
+        if (layer.attnV && layer.attnV instanceof Tensor) {
           const vData = await layer.attnV.toArray();
           let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
           for (let j = 0; j < vData.length; j++) {
@@ -614,10 +793,15 @@ export async function loadLlamaWeights(
           }
           const mean = sum / vData.length;
           const variance = sumSq / vData.length - mean * mean;
-          console.log(`  attnV: [${layer.attnV.shape.join(', ')}]`);
+          console.log(`  attnV: [${layer.attnV.shape.join(', ')}] (f32)`);
           console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+        } else if (layer.attnV && layer.attnV instanceof QuantizedTensor) {
+          const qt = layer.attnV;
+          const stats = qt.getMemoryStats();
+          console.log(`  attnV: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
-        // Check biases
+        // Check biases (always f32)
         if (layer.attnKBias) {
           const biasData = await layer.attnKBias.toArray();
           let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;

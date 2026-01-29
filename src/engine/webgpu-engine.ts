@@ -13,12 +13,14 @@ import {
   ops,
   rmsNorm,
   applyRope,
-  feedForward,
+  feedForwardQ,
+  matmulQ,
   loadLlamaWeights,
   disposeLlamaWeights,
   estimateModelMemory,
   getCommandBatcherStats,
   resetCommandBatcherStats,
+  QuantizedTensor,
   type LlamaWeights,
   type LlamaLayerWeights,
 } from './webgpu/index.js';
@@ -46,6 +48,7 @@ export interface WebGPUEngineOptions {
 export interface WebGPULoadModelOptions {
   contextLength?: number;
   batchSize?: number;
+  keepQuantized?: boolean; // Keep weights in quantized format (Q4_K, Q8_0) for reduced VRAM
 }
 
 export interface WebGPUGenerateOptions {
@@ -186,7 +189,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
 
       // Load weights to GPU
-      await this.loadWeights(modelPath);
+      await this.loadWeights(modelPath, options);
 
       this.modelLoaded = true;
       this.emit('loaded', {
@@ -241,7 +244,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   /**
    * Load model weights to GPU tensors
    */
-  private async loadWeights(modelPath: string): Promise<void> {
+  private async loadWeights(modelPath: string, options: WebGPULoadModelOptions = {}): Promise<void> {
     if (!this.ggufFile) {
       throw new Error('GGUF file not parsed');
     }
@@ -261,9 +264,15 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     try {
       // Load actual weights from GGUF file using the model loader
+      const keepQuantized = options.keepQuantized ?? false;
       this.weights = await loadLlamaWeights(modelPath, this.ggufFile, {
-        dequantize: true,
+        dequantize: !keepQuantized,  // Dequantize to f32 if not keeping quantized
+        keepQuantized,               // Keep Q4_K/Q8_0 weights on GPU for reduced VRAM
       });
+
+      if (keepQuantized) {
+        console.log('Keeping weights in quantized format (reduced VRAM mode)');
+      }
 
       // Count loaded layers
       const loadedLayers = this.weights.layers.filter(
@@ -528,7 +537,12 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // GGUF weights are [in_features, out_features], correct for x @ W
       layerT0 = performance.now();
       if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
-        const ffnOut = await feedForward(normed2, layer.ffnGate, layer.ffnUp, layer.ffnDown);
+        const ffnOut = await feedForwardQ(
+          normed2,
+          layer.ffnGate,
+          layer.ffnUp,
+          layer.ffnDown
+        );
 
         // Debug: check hidden after FFN for last position (layer 0 only)
         if (layerIdx === 0 && DEBUG) {
@@ -598,7 +612,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     t0 = performance.now();
     let logits: Tensor;
     if (this.weights.outputWeight) {
-      logits = await ops.matmul(lastTokenHidden, this.weights.outputWeight);
+      logits = await matmulQ(lastTokenHidden, this.weights.outputWeight);
 
       // Debug: check logits
       if (DEBUG) {
@@ -700,7 +714,12 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       const normed2 = await rmsNorm(hidden, layer.ffnNorm!, this.rmsNormEps);
 
       // Feed-forward
-      const ffnOut = await feedForward(normed2, layer.ffnGate!, layer.ffnUp!, layer.ffnDown!);
+      const ffnOut = await feedForwardQ(
+        normed2,
+        layer.ffnGate!,
+        layer.ffnUp!,
+        layer.ffnDown!
+      );
       normed2.destroy();
 
       // Residual connection
@@ -730,7 +749,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     // Output projection for all positions
     let logitsTensor: Tensor;
     if (this.weights.outputWeight) {
-      logitsTensor = await ops.matmul(multiHidden, this.weights.outputWeight);
+      logitsTensor = await matmulQ(multiHidden, this.weights.outputWeight);
     } else {
       logitsTensor = Tensor.random([numLogits, this.vocabSize], { label: 'logits' });
     }
@@ -775,13 +794,31 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     let t0 = shouldTime ? performance.now() : 0;
     const attnTimings: Record<string, number> = {};
 
-    // Project to Q, K, V for new tokens only (fused kernel reads x once)
-    const { Q: qRaw, K: kRaw, V: vProjRaw } = await ops.fusedQKVProjection(
-      x, layer.attnQ!, layer.attnK!, layer.attnV!
-    );
-    let q = qRaw;
-    let k = kRaw;
-    let vProj = vProjRaw;
+    // Project to Q, K, V for new tokens only
+    // Use fused kernel for f32, separate matmulQ for quantized
+    let q: Tensor, k: Tensor, vProj: Tensor;
+    const hasQuantizedQKV =
+      layer.attnQ instanceof QuantizedTensor ||
+      layer.attnK instanceof QuantizedTensor ||
+      layer.attnV instanceof QuantizedTensor;
+
+    if (hasQuantizedQKV) {
+      // Quantized path - separate projections with GEMV
+      q = await matmulQ(x, layer.attnQ!);
+      k = await matmulQ(x, layer.attnK!);
+      vProj = await matmulQ(x, layer.attnV!);
+    } else {
+      // f32 path - use fused kernel (reads x once)
+      const { Q: qRaw, K: kRaw, V: vProjRaw } = await ops.fusedQKVProjection(
+        x,
+        layer.attnQ! as Tensor,
+        layer.attnK! as Tensor,
+        layer.attnV! as Tensor
+      );
+      q = qRaw;
+      k = kRaw;
+      vProj = vProjRaw;
+    }
     if (shouldTime) { attnTimings['qkvProj'] = performance.now() - t0; t0 = performance.now(); }
 
     // Apply biases if present (Qwen uses Q/K/V biases)
@@ -891,7 +928,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
 
     // Output projection: [processLen, numHeads * headDim] @ [numHeads * headDim, hiddenSize]
-    const projected = await ops.matmul(attnOut, layer.attnOutput!);
+    const projected = await matmulQ(attnOut, layer.attnOutput!);
     attnOut.destroy();
     if (shouldTime) {
       attnTimings['outProj'] = performance.now() - t0;

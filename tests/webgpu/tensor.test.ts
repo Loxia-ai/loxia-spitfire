@@ -715,7 +715,11 @@ describeWebGPU('WebGPU Tensor Operations', () => {
       const result = await ops.neg(t);
       const data = await result.toArray();
 
-      expect(Array.from(data)).toEqual([2, 1, 0, -1, -2]);
+      // Use toBeCloseTo for each element to handle -0 vs 0 correctly
+      const expected = [2, 1, 0, -1, -2];
+      for (let i = 0; i < expected.length; i++) {
+        expect(data[i]).toBeCloseTo(expected[i], 5);
+      }
 
       t.destroy();
       result.destroy();

@@ -20,6 +20,12 @@ import {
 } from '../buffer.js';
 import { GGMLType } from '../../../types/model.js';
 
+// Re-export QuantizedTensor for GPU-resident quantized storage
+export { QuantizedTensor, type SupportedQuantType } from './qtensor.js';
+
+// Re-export quantized GEMV/GEMM operations
+export { gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K, resetQGemvPipelines } from './qgemv.js';
+
 // ============================================================================
 // Q4_0 Quantization
 // Block size: 32 values per block
@@ -109,11 +115,13 @@ struct Params {
   _pad3: u32,
 }
 
+// Q8_0 data stored as raw bytes (accessed as u32 array)
 @group(0) @binding(0) var<storage, read> quantized: array<u32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
 const BLOCK_SIZE: u32 = 32u;
+const BYTES_PER_BLOCK: u32 = 34u;  // 2 bytes scale + 32 bytes values
 
 fn unpack_f16(packed: u32) -> f32 {
   let sign = (packed >> 15u) & 1u;
@@ -134,9 +142,21 @@ fn unpack_f16(packed: u32) -> f32 {
   return select(1.0, -1.0, sign == 1u) * m * pow(2.0, f32(e));
 }
 
-fn unpack_i8(packed: u32, idx: u32) -> i32 {
-  let byte = (packed >> (idx * 8u)) & 0xFFu;
-  // Sign extend from 8 bits
+// Read a byte from the quantized array (which is stored as u32s)
+fn read_byte(byteOffset: u32) -> u32 {
+  let u32Idx = byteOffset / 4u;
+  let byteInU32 = byteOffset % 4u;
+  return (quantized[u32Idx] >> (byteInU32 * 8u)) & 0xFFu;
+}
+
+// Read u16 from byte offset (little-endian)
+fn read_u16(byteOffset: u32) -> u32 {
+  return read_byte(byteOffset) | (read_byte(byteOffset + 1u) << 8u);
+}
+
+// Read signed i8 from byte offset
+fn read_i8(byteOffset: u32) -> i32 {
+  let byte = read_byte(byteOffset);
   return select(i32(byte), i32(byte) - 256, byte >= 128u);
 }
 
@@ -147,24 +167,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
 
-  // Q8_0 block layout:
-  // - 2 bytes: f16 scale
-  // - 32 bytes: 32 x int8 values
-  // We pack as: 1 u32 for scale (lower 16 bits) + 8 u32s for values
-  let baseIdx = blockIdx * 9u;
+  // Q8_0 block layout (34 bytes):
+  // - bytes 0-1: f16 scale
+  // - bytes 2-33: 32 x int8 values
+  let blockByteOffset = blockIdx * BYTES_PER_BLOCK;
 
-  let scalePacked = quantized[baseIdx] & 0xFFFFu;
-  let scale = unpack_f16(scalePacked);
+  // Read f16 scale from bytes 0-1
+  let scaleBits = read_u16(blockByteOffset);
+  let scale = unpack_f16(scaleBits);
 
   let outputBase = blockIdx * BLOCK_SIZE;
 
-  // Unpack 32 int8 values from 8 u32s
-  for (var i = 0u; i < 8u; i++) {
-    let packed = quantized[baseIdx + 1u + i];
-    for (var j = 0u; j < 4u; j++) {
-      let value = f32(unpack_i8(packed, j)) * scale;
-      output[outputBase + i * 4u + j] = value;
-    }
+  // Read 32 int8 values from bytes 2-33
+  for (var i = 0u; i < BLOCK_SIZE; i++) {
+    let val = read_i8(blockByteOffset + 2u + i);
+    output[outputBase + i] = f32(val) * scale;
   }
 }
 `;

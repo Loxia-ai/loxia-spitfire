@@ -71,8 +71,11 @@ export {
   applyRope,
   attention,
   feedForward,
+  feedForwardQ,
+  matmulQ,
   mlp,
   type AttentionConfig,
+  type WeightTensor as LayerWeightTensor,
 } from './layers/index.js';
 
 export {
@@ -84,10 +87,17 @@ export {
   dequantizeQ8_0,
   dequantizeQ4_K,
   quantizeToQ8_0,
+  QuantizedTensor,
+  gemvQ8_0,
+  gemvQ4_K,
+  gemmQ8_0,
+  gemmQ4_K,
+  type SupportedQuantType,
 } from './quant/index.js';
 
 export {
   loadTensor,
+  loadWeight,
   loadTensors,
   loadTensorsByPattern,
   loadLlamaWeights,
@@ -100,6 +110,8 @@ export {
   groupTensorsByLayer,
   type TensorLoadOptions,
   type LoadedTensor,
+  type LoadedWeight,
+  type WeightTensor,
   type LlamaWeights,
   type LlamaLayerWeights,
 } from './model/index.js';

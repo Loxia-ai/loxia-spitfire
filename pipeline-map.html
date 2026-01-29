@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spitfire Pipeline Map</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #e4e4e4;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    h1 {
+      text-align: center;
+      margin-bottom: 10px;
+      color: #00d9ff;
+      font-size: 2.5em;
+      text-shadow: 0 0 20px rgba(0, 217, 255, 0.3);
+    }
+
+    .subtitle {
+      text-align: center;
+      color: #888;
+      margin-bottom: 30px;
+      font-size: 1.1em;
+    }
+
+    .controls {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 30px;
+      flex-wrap: wrap;
+    }
+
+    .controls button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      transition: all 0.3s ease;
+    }
+
+    .controls button.active {
+      transform: scale(1.05);
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+    }
+
+    .btn-all { background: #4a4a6a; color: white; }
+    .btn-all.active { background: #6a6a8a; }
+    .btn-model { background: #e74c3c; color: white; }
+    .btn-model.active { background: #ff6b5b; }
+    .btn-tokenize { background: #9b59b6; color: white; }
+    .btn-tokenize.active { background: #bb79d6; }
+    .btn-embed { background: #3498db; color: white; }
+    .btn-embed.active { background: #54b8fb; }
+    .btn-attention { background: #e67e22; color: white; }
+    .btn-attention.active { background: #ff9e42; }
+    .btn-ffn { background: #27ae60; color: white; }
+    .btn-ffn.active { background: #47ce80; }
+    .btn-output { background: #f39c12; color: white; }
+    .btn-output.active { background: #ffbc32; }
+    .btn-sample { background: #1abc9c; color: white; }
+    .btn-sample.active { background: #3adcbc; }
+    .btn-cache { background: #8e44ad; color: white; }
+    .btn-cache.active { background: #ae64cd; }
+    .btn-gpu { background: #2c3e50; color: white; }
+    .btn-gpu.active { background: #4c5e70; }
+
+    .pipeline-container {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+
+    .milestone {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 16px;
+      padding: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      transition: all 0.3s ease;
+    }
+
+    .milestone.highlighted {
+      border-color: rgba(0, 217, 255, 0.5);
+      box-shadow: 0 0 30px rgba(0, 217, 255, 0.2);
+    }
+
+    .milestone.dimmed {
+      opacity: 0.3;
+    }
+
+    .milestone-header {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      margin-bottom: 15px;
+    }
+
+    .milestone-number {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 1.2em;
+      flex-shrink: 0;
+    }
+
+    .milestone-title {
+      font-size: 1.4em;
+      font-weight: 600;
+    }
+
+    .milestone-desc {
+      color: #aaa;
+      font-size: 0.95em;
+      margin-left: 55px;
+      margin-bottom: 15px;
+    }
+
+    .files-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 12px;
+      margin-left: 55px;
+    }
+
+    .file-card {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 10px;
+      padding: 15px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      transition: all 0.2s ease;
+    }
+
+    .file-card:hover {
+      border-color: rgba(255, 255, 255, 0.2);
+      transform: translateY(-2px);
+    }
+
+    .file-card.gpu-intensive {
+      border-left: 3px solid #f39c12;
+    }
+
+    .file-card.critical-path {
+      border-left: 3px solid #e74c3c;
+    }
+
+    .file-path {
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.85em;
+      color: #00d9ff;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+
+    .file-role {
+      font-size: 0.9em;
+      color: #ccc;
+      margin-bottom: 10px;
+    }
+
+    .file-functions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .func-tag {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.75em;
+      font-family: monospace;
+      color: #aaa;
+    }
+
+    .func-tag.hot {
+      background: rgba(231, 76, 60, 0.3);
+      color: #ff8a80;
+    }
+
+    .legend {
+      display: flex;
+      justify-content: center;
+      gap: 30px;
+      margin-top: 30px;
+      padding: 15px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 10px;
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9em;
+    }
+
+    .legend-color {
+      width: 20px;
+      height: 4px;
+      border-radius: 2px;
+    }
+
+    .perf-tips {
+      max-width: 1600px;
+      margin: 40px auto 0;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 16px;
+      padding: 25px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .perf-tips h2 {
+      color: #f39c12;
+      margin-bottom: 15px;
+    }
+
+    .perf-tips ul {
+      list-style: none;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+      gap: 15px;
+    }
+
+    .perf-tips li {
+      padding: 12px 15px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      border-left: 3px solid #f39c12;
+    }
+
+    .perf-tips li strong {
+      color: #00d9ff;
+    }
+
+    .data-flow {
+      max-width: 1600px;
+      margin: 30px auto;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 16px;
+      padding: 25px;
+      overflow-x: auto;
+    }
+
+    .data-flow h2 {
+      color: #00d9ff;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+
+    .flow-diagram {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 20px 0;
+    }
+
+    .flow-step {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 12px 20px;
+      border-radius: 8px;
+      text-align: center;
+      min-width: 120px;
+    }
+
+    .flow-step.input { background: rgba(155, 89, 182, 0.3); }
+    .flow-step.process { background: rgba(52, 152, 219, 0.3); }
+    .flow-step.gpu { background: rgba(230, 126, 34, 0.3); }
+    .flow-step.output { background: rgba(26, 188, 156, 0.3); }
+
+    .flow-arrow {
+      color: #666;
+      font-size: 1.5em;
+    }
+
+    @media (max-width: 768px) {
+      .files-grid {
+        margin-left: 0;
+      }
+      .milestone-desc {
+        margin-left: 0;
+      }
+      h1 { font-size: 1.8em; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Spitfire Pipeline Map</h1>
+  <p class="subtitle">WebGPU LLM Inference Engine - File & Pipeline Architecture</p>
+
+  <div class="controls">
+    <button class="btn-all active" onclick="filterMilestone('all')">All Stages</button>
+    <button class="btn-model" onclick="filterMilestone('model')">1. Model Loading</button>
+    <button class="btn-tokenize" onclick="filterMilestone('tokenize')">2. Tokenization</button>
+    <button class="btn-embed" onclick="filterMilestone('embed')">3. Embedding</button>
+    <button class="btn-attention" onclick="filterMilestone('attention')">4. Attention</button>
+    <button class="btn-ffn" onclick="filterMilestone('ffn')">5. Feed-Forward</button>
+    <button class="btn-output" onclick="filterMilestone('output')">6. Output Projection</button>
+    <button class="btn-sample" onclick="filterMilestone('sample')">7. Sampling</button>
+    <button class="btn-cache" onclick="filterMilestone('cache')">KV Cache</button>
+    <button class="btn-gpu" onclick="filterMilestone('gpu')">GPU Infrastructure</button>
+  </div>
+
+  <div class="data-flow">
+    <h2>Token Generation Data Flow</h2>
+    <div class="flow-diagram">
+      <div class="flow-step input">Prompt<br><small>string</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step process">Tokenize<br><small>number[]</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step gpu">Embed<br><small>[seq, hidden]</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step gpu">Attention<br><small>×N layers</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step gpu">FFN<br><small>×N layers</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step gpu">Output Proj<br><small>[vocab]</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step process">Sample<br><small>token ID</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step output">Decode<br><small>string</small></div>
+    </div>
+  </div>
+
+  <div class="pipeline-container">
+
+    <!-- Milestone 1: Model Loading -->
+    <div class="milestone" data-stage="model">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #e74c3c;">1</div>
+        <div class="milestone-title">Model Loading & GGUF Parsing</div>
+      </div>
+      <div class="milestone-desc">
+        Parse GGUF file format, extract architecture metadata, dequantize weights, and upload to GPU memory.
+        <strong>One-time cost at startup (10-60 seconds depending on model size).</strong>
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path">
+          <div class="file-path">src/model/gguf.ts</div>
+          <div class="file-role">GGUF binary format parser - reads header, metadata, tensor info with buffered I/O</div>
+          <div class="file-functions">
+            <span class="func-tag hot">parseGGUF()</span>
+            <span class="func-tag">extractArchitecture()</span>
+            <span class="func-tag">getChatTemplate()</span>
+            <span class="func-tag">BufferedReader</span>
+          </div>
+        </div>
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu/model/loader.ts</div>
+          <div class="file-role">Loads GGUF tensors to GPU with dequantization - converts quantized weights to f32</div>
+          <div class="file-functions">
+            <span class="func-tag hot">loadLlamaWeights()</span>
+            <span class="func-tag">loadTensor()</span>
+            <span class="func-tag">estimateModelMemory()</span>
+            <span class="func-tag">disposeLlamaWeights()</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/engine/webgpu/quant/index.ts</div>
+          <div class="file-role">Dequantization kernels for Q4_0, Q4_1, Q8_0, K-quants, etc.</div>
+          <div class="file-functions">
+            <span class="func-tag hot">dequantize()</span>
+            <span class="func-tag">Q4_0, Q8_0, Q4_K</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/model/manifest.ts</div>
+          <div class="file-role">Ollama manifest parsing and model discovery</div>
+          <div class="file-functions">
+            <span class="func-tag">parseManifest()</span>
+            <span class="func-tag">resolveModelPath()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 2: Tokenization -->
+    <div class="milestone" data-stage="tokenize">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #9b59b6;">2</div>
+        <div class="milestone-title">Tokenization</div>
+      </div>
+      <div class="milestone-desc">
+        Convert text to token IDs using BPE (Byte-Pair Encoding). CPU-bound, runs once per prompt.
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path">
+          <div class="file-path">src/tokenizer/index.ts</div>
+          <div class="file-role">BPE tokenizer with vocabulary and merge rules from GGUF metadata</div>
+          <div class="file-functions">
+            <span class="func-tag hot">encode()</span>
+            <span class="func-tag">decodeToken()</span>
+            <span class="func-tag">fromGGUF()</span>
+            <span class="func-tag">applyBPE()</span>
+            <span class="func-tag">preTokenize()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 3: Embedding Lookup -->
+    <div class="milestone" data-stage="embed">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #3498db;">3</div>
+        <div class="milestone-title">Token Embedding Lookup</div>
+      </div>
+      <div class="milestone-desc">
+        Convert token IDs to dense vectors via embedding table lookup. GPU operation: [seqLen] → [seqLen, hiddenSize]
+      </div>
+      <div class="files-grid">
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu-engine.ts</div>
+          <div class="file-role">Main forward() function - embeds tokens via GPU gather operation</div>
+          <div class="file-functions">
+            <span class="func-tag hot">forward()</span>
+            <span class="func-tag">embedTokens</span>
+          </div>
+        </div>
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu/ops/index.ts</div>
+          <div class="file-role">GPU embedding gather - selects rows from embedding table</div>
+          <div class="file-functions">
+            <span class="func-tag hot">gather()</span>
+            <span class="func-tag">matmul()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 4: Self-Attention -->
+    <div class="milestone" data-stage="attention">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #e67e22;">4</div>
+        <div class="milestone-title">Self-Attention (×N layers)</div>
+      </div>
+      <div class="milestone-desc">
+        <strong>MOST COMPUTE-INTENSIVE STAGE.</strong> Q/K/V projection, RoPE, causal attention with KV cache.
+        Runs N times (once per transformer layer). GQA support for efficient KV heads.
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path gpu-intensive">
+          <div class="file-path">src/engine/webgpu-engine.ts</div>
+          <div class="file-role">selfAttention() orchestrates the full attention pipeline per layer</div>
+          <div class="file-functions">
+            <span class="func-tag hot">selfAttention()</span>
+            <span class="func-tag">addBias()</span>
+          </div>
+        </div>
+        <div class="file-card critical-path gpu-intensive">
+          <div class="file-path">src/engine/webgpu/ops/index.ts</div>
+          <div class="file-role">GPU attention kernels - fused QKV projection, causal attention with softmax</div>
+          <div class="file-functions">
+            <span class="func-tag hot">fusedQKVProjection()</span>
+            <span class="func-tag hot">causalAttention()</span>
+            <span class="func-tag">copyRows()</span>
+            <span class="func-tag">broadcastAdd()</span>
+          </div>
+        </div>
+        <div class="file-card critical-path gpu-intensive">
+          <div class="file-path">src/engine/webgpu/layers/index.ts</div>
+          <div class="file-role">RoPE embeddings and RMS normalization WGSL shaders</div>
+          <div class="file-functions">
+            <span class="func-tag hot">applyRope()</span>
+            <span class="func-tag hot">rmsNorm()</span>
+            <span class="func-tag">ROPE_SHADER</span>
+            <span class="func-tag">RMSNORM_SHADER</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 5: Feed-Forward Network -->
+    <div class="milestone" data-stage="ffn">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #27ae60;">5</div>
+        <div class="milestone-title">Feed-Forward Network (×N layers)</div>
+      </div>
+      <div class="milestone-desc">
+        SwiGLU activation: silu(x @ Wgate) * (x @ Wup) @ Wdown. Runs after attention in each layer.
+        <strong>Large matrix multiplications dominate compute time.</strong>
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path gpu-intensive">
+          <div class="file-path">src/engine/webgpu/layers/index.ts</div>
+          <div class="file-role">Fused SwiGLU feed-forward implementation</div>
+          <div class="file-functions">
+            <span class="func-tag hot">feedForward()</span>
+            <span class="func-tag">SWIGLU_SHADER</span>
+          </div>
+        </div>
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu/ops/index.ts</div>
+          <div class="file-role">Matrix multiplication for gate/up/down projections</div>
+          <div class="file-functions">
+            <span class="func-tag hot">matmul()</span>
+            <span class="func-tag hot">fusedSwiGLU()</span>
+            <span class="func-tag">silu()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 6: Output Projection -->
+    <div class="milestone" data-stage="output">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #f39c12;">6</div>
+        <div class="milestone-title">Output Projection & Logits</div>
+      </div>
+      <div class="milestone-desc">
+        Final RMS norm, extract last token's hidden state, project to vocabulary logits.
+        GPU→CPU transfer of [vocabSize] floats.
+      </div>
+      <div class="files-grid">
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu-engine.ts</div>
+          <div class="file-role">forward() end section - final norm and output projection</div>
+          <div class="file-functions">
+            <span class="func-tag hot">forward()</span>
+            <span class="func-tag">sliceLastRow()</span>
+            <span class="func-tag">outputProjection</span>
+          </div>
+        </div>
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu/ops/index.ts</div>
+          <div class="file-role">Slice last row from hidden states, matmul with output weights</div>
+          <div class="file-functions">
+            <span class="func-tag hot">sliceLastRow()</span>
+            <span class="func-tag">sliceLastRows()</span>
+            <span class="func-tag">matmul()</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/engine/webgpu/buffer.ts</div>
+          <div class="file-role">GPU→CPU read for logits transfer</div>
+          <div class="file-functions">
+            <span class="func-tag hot">readBufferFloat32()</span>
+            <span class="func-tag">readBuffer()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Milestone 7: Sampling -->
+    <div class="milestone" data-stage="sample">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #1abc9c;">7</div>
+        <div class="milestone-title">Token Sampling</div>
+      </div>
+      <div class="milestone-desc">
+        Apply temperature, top-k selection (min-heap O(V log k)), softmax, random sampling. CPU operation.
+      </div>
+      <div class="files-grid">
+        <div class="file-card">
+          <div class="file-path">src/engine/webgpu-engine.ts</div>
+          <div class="file-role">sampleToken() with efficient min-heap top-k</div>
+          <div class="file-functions">
+            <span class="func-tag hot">sampleToken()</span>
+            <span class="func-tag">temperature</span>
+            <span class="func-tag">topK</span>
+            <span class="func-tag">heapPush/Pop</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/engine/speculative.ts</div>
+          <div class="file-role">N-gram draft cache for speculative decoding - predicts multiple tokens</div>
+          <div class="file-functions">
+            <span class="func-tag">NgramDraftCache</span>
+            <span class="func-tag">getDrafts()</span>
+            <span class="func-tag">lookup()</span>
+            <span class="func-tag">update()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- KV Cache Management -->
+    <div class="milestone" data-stage="cache">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #8e44ad;">KV</div>
+        <div class="milestone-title">KV Cache Management</div>
+      </div>
+      <div class="milestone-desc">
+        GPU-resident key/value cache for O(n) incremental generation instead of O(n²) recomputation.
+        <strong>Critical for generation speed - keeps data on GPU.</strong>
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path gpu-intensive">
+          <div class="file-path">src/engine/webgpu-engine.ts</div>
+          <div class="file-role">KV cache lifecycle - create, update, rollback, clear</div>
+          <div class="file-functions">
+            <span class="func-tag hot">createGPUKVCache()</span>
+            <span class="func-tag hot">rollbackKVCache()</span>
+            <span class="func-tag">clearKVCache()</span>
+            <span class="func-tag">GPUKVCache interface</span>
+          </div>
+        </div>
+        <div class="file-card gpu-intensive">
+          <div class="file-path">src/engine/webgpu/ops/index.ts</div>
+          <div class="file-role">GPU operations for cache updates</div>
+          <div class="file-functions">
+            <span class="func-tag hot">copyRows()</span>
+            <span class="func-tag">createCacheTensor()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GPU Infrastructure -->
+    <div class="milestone" data-stage="gpu">
+      <div class="milestone-header">
+        <div class="milestone-number" style="background: #2c3e50;">GPU</div>
+        <div class="milestone-title">GPU Infrastructure</div>
+      </div>
+      <div class="milestone-desc">
+        WebGPU device management, shader compilation, buffer allocation, command batching.
+        <strong>Foundation layer - performance of all GPU ops depends on this.</strong>
+      </div>
+      <div class="files-grid">
+        <div class="file-card critical-path">
+          <div class="file-path">src/engine/webgpu/device.ts</div>
+          <div class="file-role">WebGPU adapter/device initialization and singleton management</div>
+          <div class="file-functions">
+            <span class="func-tag hot">initWebGPU()</span>
+            <span class="func-tag">getWebGPUDevice()</span>
+            <span class="func-tag">isAvailable()</span>
+          </div>
+        </div>
+        <div class="file-card critical-path">
+          <div class="file-path">src/engine/webgpu/shader.ts</div>
+          <div class="file-role">WGSL compilation, pipeline caching, command batching (15 cmds/submit)</div>
+          <div class="file-functions">
+            <span class="func-tag hot">CommandBatcher</span>
+            <span class="func-tag hot">executeCompute()</span>
+            <span class="func-tag">createComputePipeline()</span>
+            <span class="func-tag">createBindGroup()</span>
+            <span class="func-tag">requestBufferDestroy()</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/engine/webgpu/buffer.ts</div>
+          <div class="file-role">GPU buffer allocation, pooling, read/write operations</div>
+          <div class="file-functions">
+            <span class="func-tag hot">BufferPool</span>
+            <span class="func-tag">createStorageBuffer()</span>
+            <span class="func-tag">readBuffer()</span>
+            <span class="func-tag">writeBuffer()</span>
+          </div>
+        </div>
+        <div class="file-card">
+          <div class="file-path">src/engine/webgpu/tensor.ts</div>
+          <div class="file-role">GPU tensor wrapper - shape, dtype, buffer management</div>
+          <div class="file-functions">
+            <span class="func-tag">Tensor class</span>
+            <span class="func-tag">toArray()</span>
+            <span class="func-tag">destroy()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <div class="legend-item">
+      <div class="legend-color" style="background: #e74c3c;"></div>
+      <span>Critical Path (latency-sensitive)</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-color" style="background: #f39c12;"></div>
+      <span>GPU Intensive (compute-bound)</span>
+    </div>
+    <div class="legend-item">
+      <span class="func-tag hot" style="margin: 0;">hot()</span>
+      <span>Performance-critical function</span>
+    </div>
+  </div>
+
+  <div class="perf-tips">
+    <h2>Performance Optimization Targets</h2>
+    <ul>
+      <li><strong>Attention (Stage 4)</strong> - Largest compute cost. Target: fused kernels, flash attention, tensor cores</li>
+      <li><strong>FFN MatMul (Stage 5)</strong> - Large matrices. Target: tiled matmul, shared memory optimization</li>
+      <li><strong>Command Batching</strong> - Currently batches 15 commands. Target: tune batch size per workload</li>
+      <li><strong>Buffer Reuse</strong> - BufferPool reduces allocation. Target: better lifetime tracking</li>
+      <li><strong>KV Cache</strong> - GPU-resident. Target: paged attention for longer contexts</li>
+      <li><strong>Speculative Decoding</strong> - N-gram drafts. Target: tree speculation, better draft quality</li>
+      <li><strong>Quantization</strong> - Dequant on load. Target: keep quantized for inference (INT4 matmul)</li>
+      <li><strong>GPU→CPU Transfer</strong> - Only logits transferred. Target: minimize sync points</li>
+    </ul>
+  </div>
+
+  <script>
+    function filterMilestone(stage) {
+      // Update button states
+      document.querySelectorAll('.controls button').forEach(btn => {
+        btn.classList.remove('active');
+      });
+      event.target.classList.add('active');
+
+      // Update milestone visibility
+      document.querySelectorAll('.milestone').forEach(m => {
+        if (stage === 'all') {
+          m.classList.remove('dimmed', 'highlighted');
+        } else if (m.dataset.stage === stage) {
+          m.classList.add('highlighted');
+          m.classList.remove('dimmed');
+        } else {
+          m.classList.add('dimmed');
+          m.classList.remove('highlighted');
+        }
+      });
+    }
+  </script>
+</body>
+</html>

@@ -24,6 +24,11 @@ export interface BindGroupEntry {
 const shaderCache = new Map<string, GPUShaderModule>();
 
 /**
+ * Reverse map from shader module to source string (for pipeline cache key)
+ */
+const moduleToSource = new WeakMap<GPUShaderModule, string>();
+
+/**
  * Pipeline cache for compute pipelines
  */
 const pipelineCache = new Map<string, GPUComputePipeline>();
@@ -248,6 +253,9 @@ export function createShaderModule(
     code: source,
   });
 
+  // Store reverse mapping for pipeline cache key generation
+  moduleToSource.set(module, source);
+
   // Check for compilation errors asynchronously
   module.getCompilationInfo().then((info) => {
     for (const message of info.messages) {
@@ -278,8 +286,9 @@ export function createComputePipeline(
 ): GPUComputePipeline {
   const { label, entryPoint = 'main', constants } = options;
 
-  // Create cache key
-  const cacheKey = `${shaderModule.label || 'shader'}-${entryPoint}-${JSON.stringify(constants || {})}`;
+  // Create cache key using shader source (not label) for uniqueness
+  const shaderSource = moduleToSource.get(shaderModule) || shaderModule.label || 'unknown';
+  const cacheKey = `${shaderSource}-${entryPoint}-${JSON.stringify(constants || {})}`;
   const cached = pipelineCache.get(cacheKey);
   if (cached) {
     return cached;
