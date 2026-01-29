@@ -26,6 +26,9 @@ export { QuantizedTensor, type SupportedQuantType } from './qtensor.js';
 // Re-export quantized GEMV/GEMM operations
 export { gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K, resetQGemvPipelines } from './qgemv.js';
 
+// Re-export optimized quantized GEMV operations (Phase 1: Memory Coalescing)
+export { gemvQ4_K_optimized, resetOptimizedPipelines } from './qgemv-optimized.js';
+
 // ============================================================================
 // Q4_0 Quantization
 // Block size: 32 values per block
