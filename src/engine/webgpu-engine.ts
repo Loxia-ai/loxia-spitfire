@@ -426,7 +426,10 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       isIncremental = true;
       startPos = this.kvCache.seqLen;
       tokensToProcess = inputIds.slice(startPos);
-      console.log(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos} (cache has ${this.kvCache.seqLen} tokens)`);
+      // Reduce logging noise - only log for multi-token incremental (speculation)
+      if (tokensToProcess.length > 1) {
+        console.log(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos}`);
+      }
     } else {
       // Full mode: process all tokens (prefill)
       tokensToProcess = inputIds;
@@ -440,7 +443,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         this.kvCache = this.createGPUKVCache(maxSeqLen);
       }
 
-      console.log(`[Forward] PREFILL: processing ${tokensToProcess.length} tokens (useCache=${useCache})`);
+      console.log(`[Forward] PREFILL: processing ${tokensToProcess.length} tokens`);
     }
 
     const processLen = tokensToProcess.length;
@@ -1083,6 +1086,11 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       inputIds = Array.from(formattedPrompt).map((c) => c.charCodeAt(0) % this.vocabSize);
     }
 
+    // Seed n-gram cache with prompt patterns for better speculation
+    if (ngramCache && inputIds.length > 10) {
+      ngramCache.seedFromPrompt(inputIds);
+    }
+
     const generatedTokens: number[] = [];
     let generatedText = '';
     const eosId = this.tokenizer?.eosTokenId ?? 2;
@@ -1125,7 +1133,6 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         const draftTokens = ngramCache.getDrafts(allTokens, specConfig.maxDraftTokens);
 
         if (draftTokens.length > 0) {
-          console.log(`[Spec] Found ${draftTokens.length} draft tokens`);
           // Speculative path: verify draft tokens in parallel
           const cacheSeqLenBefore = this.kvCache?.seqLen ?? 0;
 
@@ -1162,7 +1169,6 @@ export class WebGPUEngine extends EventEmitter implements Engine {
           // We processed `draftTokens.length` tokens, but only keep `accepted`
           const newCacheLen = cacheSeqLenBefore + accepted;
           this.rollbackKVCache(newCacheLen);
-          console.log(`[Spec] Verified: ${accepted}/${draftTokens.length} accepted`);
 
           // Append accepted draft tokens
           let shouldStop = false;
@@ -1180,13 +1186,15 @@ export class WebGPUEngine extends EventEmitter implements Engine {
           }
 
           // Sample bonus token from last accepted position's logits
-          if (accepted > 0) {
+          // No additional forward pass needed - we already have the logits!
+          if (accepted > 0 && !shouldStop && tokenCount < maxTokens) {
             const bonusLogits = allLogits[accepted - 1];
             const bonusToken = this.sampleToken(bonusLogits, temperature, topK);
 
-            // Need to do a forward pass to update KV cache with bonus token
-            const afterAccepted = [...inputIds, ...generatedTokens];
-            await this.forward([...afterAccepted, bonusToken], true);
+            // Process ONLY the bonus token incrementally (single token, uses cache)
+            // This is O(1) layers work, not O(n) sequence length
+            const currentTokens = [...inputIds, ...generatedTokens];
+            await this.forward([...currentTokens, bonusToken], true);
             forwardPasses++;
 
             shouldStop = appendToken(bonusToken);

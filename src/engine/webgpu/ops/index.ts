@@ -1162,16 +1162,27 @@ fn main(
     let chunkLen = chunkEnd - chunkStart;
 
     // ===== Phase 1: Compute Q @ K^T scores for this chunk =====
-    // Each thread computes KPT dot products (unrolled for ILP)
+    // Each thread computes KPT dot products with vec4 optimization
     for (var j = 0u; j < KPT; j++) {
       let ki = tid * KPT + j;
       if (ki < chunkLen) {
         let globalKi = chunkStart + ki;
         var score: f32 = 0.0;
         let kBase = globalKi * numKVHeads * headDim + kvHead * headDim;
-        for (var d = 0u; d < headDim; d++) {
+
+        // Vectorized dot product: process 4 elements at a time
+        // headDim is typically 64, 80, or 128 (divisible by 4)
+        let headDim4 = headDim & ~3u;  // Round down to multiple of 4
+        for (var d = 0u; d < headDim4; d += 4u) {
+          let q4 = vec4<f32>(sharedQ[d], sharedQ[d+1u], sharedQ[d+2u], sharedQ[d+3u]);
+          let k4 = vec4<f32>(K[kBase + d], K[kBase + d + 1u], K[kBase + d + 2u], K[kBase + d + 3u]);
+          score += dot(q4, k4);
+        }
+        // Handle remainder (if headDim not divisible by 4)
+        for (var d = headDim4; d < headDim; d++) {
           score += sharedQ[d] * K[kBase + d];
         }
+
         sharedScores[ki] = score * scale;
       } else if (ki < CHUNK) {
         sharedScores[ki] = -1.0e+38;

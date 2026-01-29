@@ -227,6 +227,32 @@ export class NgramDraftCache {
   }
 
   /**
+   * Seed the cache with patterns from the prompt
+   * This helps speculation when the model continues prompt patterns
+   * (e.g., code completion, template following)
+   *
+   * @param promptTokens - Tokenized prompt
+   */
+  seedFromPrompt(promptTokens: number[]): void {
+    if (promptTokens.length < this.n + 1) return;
+
+    // Extract n-gram patterns from prompt
+    for (let i = this.n; i < promptTokens.length; i++) {
+      const context = promptTokens.slice(i - this.n, i);
+      const key = context.join(',');
+
+      // Store continuation from this position
+      const continuation = promptTokens.slice(i, Math.min(i + this.maxContinuationLen, promptTokens.length));
+      if (continuation.length > 0) {
+        const existing = this.cache.get(key);
+        if (!existing || continuation.length > existing.length) {
+          this.cache.set(key, continuation);
+        }
+      }
+    }
+  }
+
+  /**
    * Detect repeating patterns and propose continuation
    * This works even without prior n-gram history
    * @param tokens - Recent tokens to check for patterns
@@ -284,7 +310,7 @@ export class NgramDraftCache {
       }
     }
 
-    // Fall back to repeat pattern detection
+    // Fall back to repeat pattern detection (only for actual repeating patterns)
     const repeatDraft = this.detectRepeatPattern(tokens, maxLen);
     if (repeatDraft.length > 0) {
       this.stats.cacheHits++;  // Count repeat detection as a "hit"
@@ -292,19 +318,8 @@ export class NgramDraftCache {
       return repeatDraft;
     }
 
-    // Aggressive fallback: repeat last few tokens as draft
-    // Even low accuracy is better than nothing when GPU is idle
-    if (tokens.length >= 4) {
-      const recentTokens = tokens.slice(-4);  // Last 4 tokens
-      const draft: number[] = [];
-      for (let i = 0; i < maxLen; i++) {
-        draft.push(recentTokens[i % recentTokens.length]);
-      }
-      this.stats.cacheHits++;
-      this.stats.proposedTokens += draft.length;
-      return draft;
-    }
-
+    // No aggressive fallback - low acceptance rate drafts waste GPU cycles
+    // The forward pass cost scales with draft length, so bad drafts are worse than no drafts
     this.stats.cacheMisses++;
     return [];
   }

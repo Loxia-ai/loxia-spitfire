@@ -15,7 +15,7 @@ import {
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
-import { QuantizedTensor, gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K } from '../quant/index.js';
+import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemmQ8_0, gemmQ4_K } from '../quant/index.js';
 import { GGMLType } from '../../../types/model.js';
 
 /**
@@ -521,7 +521,7 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
       if (w.quantType === GGMLType.Q8_0) {
         result = await gemvQ8_0(x, w);
       } else if (w.quantType === GGMLType.Q4_K) {
-        result = await gemvQ4_K(x, w);
+        result = await gemvQ4_K_optimized(x, w);
       } else {
         throw new Error(
           `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
