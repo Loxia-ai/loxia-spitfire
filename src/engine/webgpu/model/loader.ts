@@ -15,6 +15,7 @@ import {
 import { transpose } from '../ops/index.js';
 import type { GGUFFile, GGUFTensorInfo, GGMLType } from '../../../types/model.js';
 import { GGMLType as GGMLTypeEnum } from '../../../types/model.js';
+import { debugLog, isDebugEnabled } from '../debug.js';
 
 /**
  * Options for loading tensors
@@ -147,9 +148,9 @@ export async function loadTensor(
 
     // Debug: print first few F32 values for bias tensors
     if (tensorInfo.name.includes('bias') && tensorInfo.name.includes('blk.0')) {
-      console.log(`[DEBUG F32] ${tensorInfo.name}:`);
-      console.log(`  raw bytes[0-15]: [${Array.from(data.slice(0, 16)).join(', ')}]`);
-      console.log(`  f32 values[0-3]: [${Array.from(f32Data.slice(0, 4)).map(v => v.toFixed(6)).join(', ')}]`);
+      debugLog(`[DEBUG F32] ${tensorInfo.name}:`);
+      debugLog(`  raw bytes[0-15]: [${Array.from(data.slice(0, 16)).join(', ')}]`);
+      debugLog(`  f32 values[0-3]: [${Array.from(f32Data.slice(0, 4)).map(v => v.toFixed(6)).join(', ')}]`);
     }
 
     tensor = Tensor.fromData(f32Data, shape, { label: label || tensorInfo.name });
@@ -525,9 +526,9 @@ export async function loadLlamaWeights(
     ]);
 
     // Debug: check embedding tensor
-    if (weights.tokenEmbedding) {
+    if (isDebugEnabled() && weights.tokenEmbedding) {
       const embData = await weights.tokenEmbedding.toArray();
-      console.log(`[Embedding] shape=[${weights.tokenEmbedding.shape.join(', ')}]`);
+      debugLog(`[Embedding] shape=[${weights.tokenEmbedding.shape.join(', ')}]`);
       // Check first token (id 0) and a random token
       const hiddenSize = weights.tokenEmbedding.shape[1];
       const token0 = embData.slice(0, 8);
@@ -535,11 +536,11 @@ export async function loadLlamaWeights(
       const token1000 = embData.slice(1000 * hiddenSize, 1000 * hiddenSize + 8);
       // Also check token 151644 which is the first token in test input
       const token151644 = embData.slice(151644 * hiddenSize, 151644 * hiddenSize + 8);
-      console.log(`  Token 0 first 8: [${Array.from(token0).map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`  Token 1 first 8: [${Array.from(token1).map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`  Token 1000 first 8: [${Array.from(token1000).map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`  Token 151644 first 8: [${Array.from(token151644).map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`  Token 151644 indices: ${151644 * hiddenSize} to ${151644 * hiddenSize + 7}`);
+      debugLog(`  Token 0 first 8: [${Array.from(token0).map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`  Token 1 first 8: [${Array.from(token1).map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`  Token 1000 first 8: [${Array.from(token1000).map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`  Token 151644 first 8: [${Array.from(token151644).map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`  Token 151644 indices: ${151644 * hiddenSize} to ${151644 * hiddenSize + 7}`);
     }
 
     // Load output norm (1D, no transpose needed)
@@ -555,26 +556,28 @@ export async function loadLlamaWeights(
       'lm_head.weight',
     ]);
 
-    // Debug: check output weight statistics (only for f32 Tensor)
-    if (weights.outputWeight && weights.outputWeight instanceof Tensor) {
-      const outData = await weights.outputWeight.toArray();
-      let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
-      const sampleSize = Math.min(100000, outData.length);
-      for (let j = 0; j < sampleSize; j++) {
-        sum += outData[j];
-        sumSq += outData[j] * outData[j];
-        if (outData[j] < min) min = outData[j];
-        if (outData[j] > max) max = outData[j];
+    // Debug: check output weight statistics
+    if (isDebugEnabled() && weights.outputWeight) {
+      if (weights.outputWeight instanceof Tensor) {
+        const outData = await weights.outputWeight.toArray();
+        let sum = 0, sumSq = 0, min = Infinity, max = -Infinity;
+        const sampleSize = Math.min(100000, outData.length);
+        for (let j = 0; j < sampleSize; j++) {
+          sum += outData[j];
+          sumSq += outData[j] * outData[j];
+          if (outData[j] < min) min = outData[j];
+          if (outData[j] > max) max = outData[j];
+        }
+        const mean = sum / sampleSize;
+        const variance = sumSq / sampleSize - mean * mean;
+        debugLog(`[Output Weight] shape=[${weights.outputWeight.shape.join(', ')}] (f32)`);
+        debugLog(`  mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+      } else {
+        const qt = weights.outputWeight as QuantizedTensor;
+        const stats = qt.getMemoryStats();
+        debugLog(`[Output Weight] shape=[${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+        debugLog(`  ${(stats.quantizedBytes / 1024 / 1024).toFixed(1)} MB quantized, ${stats.compressionRatio.toFixed(1)}x compression`);
       }
-      const mean = sum / sampleSize;
-      const variance = sumSq / sampleSize - mean * mean;
-      console.log(`[Output Weight] shape=[${weights.outputWeight.shape.join(', ')}] (f32)`);
-      console.log(`  mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
-    } else if (weights.outputWeight) {
-      const qt = weights.outputWeight as QuantizedTensor;
-      const stats = qt.getMemoryStats();
-      console.log(`[Output Weight] shape=[${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
-      console.log(`  ${(stats.quantizedBytes / 1024 / 1024).toFixed(1)} MB quantized, ${stats.compressionRatio.toFixed(1)}x compression`);
     }
 
     // Load layer weights
@@ -599,18 +602,18 @@ export async function loadLlamaWeights(
       const altPrefix = `layers.${i}`;
 
       // Debug: print GGUF tensor info for layer 0
-      if (i === 0) {
+      if (i === 0 && isDebugEnabled()) {
         const typeNames: { [key: number]: string } = {
           0: 'F32', 1: 'F16', 2: 'Q4_0', 3: 'Q4_1', 6: 'Q5_0', 7: 'Q5_1',
           8: 'Q8_0', 9: 'Q8_1', 10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K',
           13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K'
         };
-        console.log('[Layer 0] GGUF tensor info:');
+        debugLog('[Layer 0] GGUF tensor info:');
         for (const t of ggufFile.tensors) {
           if (t.name.includes('blk.0') &&
               (t.name.includes('attn_q') || t.name.includes('attn_k') || t.name.includes('attn_v'))) {
             const typeName = typeNames[t.type] || `type${t.type}`;
-            console.log(`  ${t.name}: ${typeName}, dims=[${t.dimensions.map(Number).join(', ')}]`);
+            debugLog(`  ${t.name}: ${typeName}, dims=[${t.dimensions.map(Number).join(', ')}]`);
           }
         }
       }
@@ -705,7 +708,7 @@ export async function loadLlamaWeights(
       layer.ffnDown = await loadLayerWeight(['ffn_down.weight', 'mlp.down_proj.weight']);
 
       // Debug: print GGUF dimensions vs final shape for layer 0
-      if (i === 0) {
+      if (i === 0 && isDebugEnabled()) {
         const printShape = async (name: string, weight: WeightTensor | null, patterns: string[]) => {
           if (!weight) return;
           const isQuant = weight instanceof QuantizedTensor;
@@ -717,12 +720,12 @@ export async function loadLlamaWeights(
             );
             if (info) {
               const typeSuffix = isQuant ? ` (${QuantizedTensor.getTypeName((weight as QuantizedTensor).quantType)})` : ' (f32)';
-              console.log(`  ${name}: GGUF dims=[${info.dimensions.join(', ')}] -> final shape=[${shape.join(', ')}]${typeSuffix}`);
+              debugLog(`  ${name}: GGUF dims=[${info.dimensions.join(', ')}] -> final shape=[${shape.join(', ')}]${typeSuffix}`);
               break;
             }
           }
         };
-        console.log('[Layer 0] GGUF dimensions vs final shapes:');
+        debugLog('[Layer 0] GGUF dimensions vs final shapes:');
         await printShape('attnQ', layer.attnQ, ['attn_q.weight']);
         await printShape('attnK', layer.attnK, ['attn_k.weight']);
         await printShape('attnV', layer.attnV, ['attn_v.weight']);
@@ -733,8 +736,8 @@ export async function loadLlamaWeights(
       }
 
       // Debug: print weight shapes and statistics for layer 0
-      if (i === 0) {
-        console.log(`[Layer 0] Weight shapes and statistics:`);
+      if (i === 0 && isDebugEnabled()) {
+        debugLog(`[Layer 0] Weight shapes and statistics:`);
         // Only print detailed stats for f32 tensors (not quantized)
         if (layer.attnQ && layer.attnQ instanceof Tensor) {
           const qData = await layer.attnQ.toArray();
@@ -747,20 +750,20 @@ export async function loadLlamaWeights(
           }
           const mean = sum / qData.length;
           const variance = sumSq / qData.length - mean * mean;
-          console.log(`  attnQ: [${layer.attnQ.shape.join(', ')}] (f32)`);
-          console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
-          console.log(`    first row (8 vals): [${Array.from(qData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          debugLog(`  attnQ: [${layer.attnQ.shape.join(', ')}] (f32)`);
+          debugLog(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+          debugLog(`    first row (8 vals): [${Array.from(qData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
           // Also print column sum for first column
           let col0Sum = 0;
           for (let r = 0; r < layer.attnQ.shape[0]; r++) {
             col0Sum += qData[r * layer.attnQ.shape[1]];
           }
-          console.log(`    column 0 sum: ${col0Sum.toFixed(4)}`);
+          debugLog(`    column 0 sum: ${col0Sum.toFixed(4)}`);
         } else if (layer.attnQ && layer.attnQ instanceof QuantizedTensor) {
           const qt = layer.attnQ;
           const stats = qt.getMemoryStats();
-          console.log(`  attnQ: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
-          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
+          debugLog(`  attnQ: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          debugLog(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
         if (layer.attnK && layer.attnK instanceof Tensor) {
           const kData = await layer.attnK.toArray();
@@ -773,14 +776,14 @@ export async function loadLlamaWeights(
           }
           const mean = sum / kData.length;
           const variance = sumSq / kData.length - mean * mean;
-          console.log(`  attnK: [${layer.attnK.shape.join(', ')}] (f32)`);
-          console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
-          console.log(`    first 8: [${Array.from(kData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          debugLog(`  attnK: [${layer.attnK.shape.join(', ')}] (f32)`);
+          debugLog(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+          debugLog(`    first 8: [${Array.from(kData.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
         } else if (layer.attnK && layer.attnK instanceof QuantizedTensor) {
           const qt = layer.attnK;
           const stats = qt.getMemoryStats();
-          console.log(`  attnK: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
-          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
+          debugLog(`  attnK: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          debugLog(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
         if (layer.attnV && layer.attnV instanceof Tensor) {
           const vData = await layer.attnV.toArray();
@@ -793,13 +796,13 @@ export async function loadLlamaWeights(
           }
           const mean = sum / vData.length;
           const variance = sumSq / vData.length - mean * mean;
-          console.log(`  attnV: [${layer.attnV.shape.join(', ')}] (f32)`);
-          console.log(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+          debugLog(`  attnV: [${layer.attnV.shape.join(', ')}] (f32)`);
+          debugLog(`    mean=${mean.toFixed(6)}, std=${Math.sqrt(variance).toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
         } else if (layer.attnV && layer.attnV instanceof QuantizedTensor) {
           const qt = layer.attnV;
           const stats = qt.getMemoryStats();
-          console.log(`  attnV: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
-          console.log(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
+          debugLog(`  attnV: [${qt.shape.join(', ')}] (${QuantizedTensor.getTypeName(qt.quantType)})`);
+          debugLog(`    ${(stats.quantizedBytes / 1024).toFixed(1)} KB, ${stats.compressionRatio.toFixed(1)}x compression`);
         }
         // Check biases (always f32)
         if (layer.attnKBias) {
@@ -813,7 +816,7 @@ export async function loadLlamaWeights(
           }
           const mean = sum / biasData.length;
           const variance = sumSq / biasData.length - mean * mean;
-          console.log(`  attnKBias: [${layer.attnKBias.shape.join(', ')}], mean=${mean.toFixed(4)}, std=${Math.sqrt(variance).toFixed(4)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
+          debugLog(`  attnKBias: [${layer.attnKBias.shape.join(', ')}], mean=${mean.toFixed(4)}, std=${Math.sqrt(variance).toFixed(4)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}`);
         }
       }
 

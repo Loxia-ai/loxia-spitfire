@@ -178,6 +178,91 @@ export class QuantizedTensor {
   }
 
   /**
+   * Quantize f32 data to Q8_0 format and create a GPU-resident QuantizedTensor.
+   *
+   * Q8_0 format: 32 values per block, 34 bytes/block
+   *   - 2 bytes: f16 scale (max_abs / 127)
+   *   - 32 bytes: int8 quantized values
+   *
+   * @param f32Data - Float32Array of weights to quantize
+   * @param shape - Logical shape [K, N] of the weight matrix
+   * @param options - Additional options (label, etc.)
+   */
+  static quantizeFromF32(
+    f32Data: Float32Array,
+    shape: number[],
+    options: QuantizedTensorOptions = {}
+  ): QuantizedTensor {
+    const blockSize = 32;
+    const bytesPerBlock = 34; // 2 (f16 scale) + 32 (int8 values)
+    const numBlocks = Math.ceil(f32Data.length / blockSize);
+    const result = new Uint8Array(numBlocks * bytesPerBlock);
+
+    for (let b = 0; b < numBlocks; b++) {
+      const blockStart = b * blockSize;
+
+      // Find max absolute value for scale
+      let maxAbs = 0;
+      for (let i = 0; i < blockSize; i++) {
+        const idx = blockStart + i;
+        if (idx < f32Data.length) {
+          const abs = Math.abs(f32Data[idx]);
+          if (abs > maxAbs) maxAbs = abs;
+        }
+      }
+
+      const scale = maxAbs / 127;
+      const invScale = scale > 0 ? 127 / maxAbs : 0;
+
+      // Convert scale to f16
+      const scaleF16 = QuantizedTensor._floatToHalf(scale);
+
+      // Write scale (little-endian f16)
+      const outBase = b * bytesPerBlock;
+      result[outBase] = scaleF16 & 0xff;
+      result[outBase + 1] = (scaleF16 >> 8) & 0xff;
+
+      // Quantize values to int8
+      for (let i = 0; i < blockSize; i++) {
+        const srcIdx = blockStart + i;
+        const value = srcIdx < f32Data.length ? f32Data[srcIdx] : 0;
+        let quantized = Math.round(value * invScale);
+        quantized = Math.max(-128, Math.min(127, quantized));
+        result[outBase + 2 + i] = quantized & 0xff;
+      }
+    }
+
+    return new QuantizedTensor(result, shape, GGMLType.Q8_0 as SupportedQuantType, options);
+  }
+
+  /**
+   * Convert f32 to f16 (IEEE 754 half-precision float).
+   */
+  private static _floatToHalf(value: number): number {
+    const floatView = new Float32Array(1);
+    const int32View = new Int32Array(floatView.buffer);
+    floatView[0] = value;
+    const f = int32View[0];
+
+    const sign = (f >> 16) & 0x8000;
+    let exp = ((f >> 23) & 0xff) - 127 + 15;
+    const mant = (f >> 13) & 0x3ff;
+
+    if (exp <= 0) {
+      if (exp < -10) return sign;
+      const m = (mant | 0x400) >> (1 - exp);
+      return sign | m;
+    } else if (exp === 0xff - 127 + 15) {
+      if (mant) return sign | 0x7c00 | mant;
+      return sign | 0x7c00;
+    } else if (exp > 30) {
+      return sign | 0x7c00;
+    }
+
+    return sign | (exp << 10) | mant;
+  }
+
+  /**
    * Get human-readable quantization type name
    */
   static getTypeName(type: SupportedQuantType): string {

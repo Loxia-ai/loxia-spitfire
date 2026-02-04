@@ -352,6 +352,16 @@ export function getMemoryTracker(): MemoryTracker {
   return globalMemoryTracker;
 }
 
+// Re-export GPU profiler
+export {
+  GPUProfiler,
+  getGPUProfiler,
+  enableGPUProfiling,
+  disableGPUProfiling,
+  destroyGPUProfiler,
+  type ProfileResult,
+} from './gpu-profiler.js';
+
 /**
  * Benchmark a function
  */

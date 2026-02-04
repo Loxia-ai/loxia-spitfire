@@ -17,6 +17,7 @@ import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
 import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemmQ8_0, gemmQ4_K, fusedFFNGateUpQ4K } from '../quant/index.js';
 import { GGMLType } from '../../../types/model.js';
+import { debugLog, isDebugEnabled } from '../debug.js';
 
 /**
  * Weight tensor type - can be f32 Tensor or quantized
@@ -152,8 +153,69 @@ fn main(
 }
 `;
 
+// Fused Add + RMSNorm shader
+// Computes: sum = a + b, output = rmsNorm(sum, weight, eps)
+// Returns BOTH sum and normalized output, saving a dispatch + buffer read
+const ADD_RMSNORM_SHADER = `
+struct Params {
+  batchSize: u32,
+  hiddenSize: u32,
+  eps: f32,
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read> weight: array<f32>;
+@group(0) @binding(3) var<storage, read_write> sum_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> norm_output: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+const WORKGROUP_SIZE: u32 = 256u;
+var<workgroup> wg_data: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>
+) {
+  let batchIdx = wid.x;
+  let localIdx = lid.x;
+  let hiddenSize = params.hiddenSize;
+  let baseIdx = batchIdx * hiddenSize;
+
+  // Step 1: Compute sum and sum of squares in one pass
+  var localSumSq: f32 = 0.0;
+  for (var i = localIdx; i < hiddenSize; i += WORKGROUP_SIZE) {
+    let s = a[baseIdx + i] + b[baseIdx + i];
+    sum_output[baseIdx + i] = s;
+    localSumSq += s * s;
+  }
+  wg_data[localIdx] = localSumSq;
+  workgroupBarrier();
+
+  // Parallel reduction for sum of squares
+  for (var s = WORKGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
+    if (localIdx < s) {
+      wg_data[localIdx] += wg_data[localIdx + s];
+    }
+    workgroupBarrier();
+  }
+  let rms = sqrt(wg_data[0] / f32(hiddenSize) + params.eps);
+  let scale = 1.0 / rms;
+  workgroupBarrier();
+
+  // Step 2: Normalize and apply weight (reading from sum_output)
+  for (var i = localIdx; i < hiddenSize; i += WORKGROUP_SIZE) {
+    norm_output[baseIdx + i] = sum_output[baseIdx + i] * scale * weight[i];
+  }
+}
+`;
+
 let layerNormPipeline: GPUComputePipeline | null = null;
 let rmsNormPipeline: GPUComputePipeline | null = null;
+let addRmsNormPipeline: GPUComputePipeline | null = null;
 
 /**
  * Layer Normalization
@@ -243,6 +305,62 @@ export async function rmsNorm(
 
   requestBufferDestroy(params);
   return output;
+}
+
+/**
+ * Fused Add + RMS Normalization
+ * Computes sum = a + b, then normed = rmsNorm(sum, weight, eps)
+ * Returns both the sum (for residual) and the normalized result.
+ * Saves one GPU dispatch and one buffer read per call compared to separate ops.
+ *
+ * @param a - First input tensor (residual)
+ * @param b - Second input tensor (attention/FFN output)
+ * @param weight - RMSNorm weight tensor
+ * @param eps - Epsilon for numerical stability
+ * @returns { sum, normed } - Both the residual sum and normalized output
+ */
+export async function addRmsNorm(
+  a: Tensor,
+  b: Tensor,
+  weight: Tensor,
+  eps = 1e-5
+): Promise<{ sum: Tensor; normed: Tensor }> {
+  if (!addRmsNormPipeline) {
+    addRmsNormPipeline = createComputePipelineFromSource(ADD_RMSNORM_SHADER, {
+      label: 'add_rmsnorm',
+      entryPoint: 'main',
+    });
+  }
+
+  const hiddenSize = a.shape[a.ndim - 1];
+  const batchSize = a.size / hiddenSize;
+
+  const sumOutput = Tensor.empty(a.shape, { label: 'add_rmsnorm_sum' });
+  const normOutput = Tensor.empty(a.shape, { label: 'add_rmsnorm_normed' });
+
+  const paramsData = new ArrayBuffer(16);
+  const paramsView = new DataView(paramsData);
+  paramsView.setUint32(0, batchSize, true);
+  paramsView.setUint32(4, hiddenSize, true);
+  paramsView.setFloat32(8, eps, true);
+  paramsView.setUint32(12, 0, true);
+
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'add_rmsnorm_params');
+
+  const bindGroup = createBindGroup(addRmsNormPipeline, 0, [
+    { binding: 0, resource: a.getBuffer() },
+    { binding: 1, resource: b.getBuffer() },
+    { binding: 2, resource: weight.getBuffer() },
+    { binding: 3, resource: sumOutput.getBuffer() },
+    { binding: 4, resource: normOutput.getBuffer() },
+    { binding: 5, resource: params },
+  ]);
+
+  const usedBuffers = [a.getBuffer(), b.getBuffer(), weight.getBuffer(), sumOutput.getBuffer(), normOutput.getBuffer(), params];
+  await executeCompute(addRmsNormPipeline, [bindGroup], [batchSize, 1, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return { sum: sumOutput, normed: normOutput };
 }
 
 // ============================================================================
@@ -510,6 +628,11 @@ export async function feedForward(
 // Debug counter for matmulQ
 let matmulQDebugCount = 0;
 
+/** Reset the debug counter (used after warmup to get fresh debug output for real inference) */
+export function resetMatmulQDebugCount(): void {
+  matmulQDebugCount = 0;
+}
+
 export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
   const M = x.shape[0];
 
@@ -543,7 +666,7 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
     }
 
     // Debug: print stats for first few matmulQ calls
-    if (matmulQDebugCount < 5) {
+    if (isDebugEnabled() && matmulQDebugCount < 5) {
       matmulQDebugCount++;
       const data = await result.toArray();
       let sum = 0, min = Infinity, max = -Infinity, nanCount = 0;
@@ -554,7 +677,7 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
         if (data[i] > max) max = data[i];
       }
       const mean = sum / Math.min(1000, data.length);
-      console.log(`[matmulQ #${matmulQDebugCount}] X:[${x.shape}] @ W:[${w.shape}] -> [${result.shape}], mean=${mean.toFixed(4)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, nans=${nanCount}, first5=[${Array.from(data.slice(0, 5)).map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`[matmulQ #${matmulQDebugCount}] X:[${x.shape}] @ W:[${w.shape}] -> [${result.shape}], mean=${mean.toFixed(4)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, nans=${nanCount}, first5=[${Array.from(data.slice(0, 5)).map(v => v.toFixed(4)).join(', ')}]`);
     }
 
     return result;
@@ -668,5 +791,6 @@ export async function mlp(
 export function resetLayersPipelines(): void {
   layerNormPipeline = null;
   rmsNormPipeline = null;
+  addRmsNormPipeline = null;
   ropePipeline = null;
 }

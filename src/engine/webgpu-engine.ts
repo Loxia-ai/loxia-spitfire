@@ -12,6 +12,7 @@ import {
   Tensor,
   ops,
   rmsNorm,
+  addRmsNorm,
   applyRope,
   feedForwardQ,
   matmulQ,
@@ -20,6 +21,7 @@ import {
   estimateModelMemory,
   getCommandBatcherStats,
   resetCommandBatcherStats,
+  resetMatmulQDebugCount,
   QuantizedTensor,
   type LlamaWeights,
   type LlamaLayerWeights,
@@ -34,6 +36,7 @@ import {
   type SpeculativeOptions,
   DEFAULT_SPECULATIVE_OPTIONS,
 } from './speculative.js';
+import { debugLog, setDebugEnabled } from './webgpu/debug.js';
 
 // Configure nunjucks for Jinja2 compatibility
 const nunjucksEnv = new nunjucks.Environment(null, { autoescape: false });
@@ -45,6 +48,7 @@ nunjucksEnv.addFilter('tojson', (obj: unknown) => JSON.stringify(obj));
 export interface WebGPUEngineOptions {
   numThreads?: number; // Ignored for WebGPU (GPU handles parallelism)
   debug?: boolean; // Enable verbose debug output (slower due to GPU-CPU transfers)
+  dawnToggles?: string[]; // Dawn backend toggles (Node.js only)
 }
 
 export interface WebGPULoadModelOptions {
@@ -82,6 +86,33 @@ interface GPUKVCache {
 }
 
 /**
+ * Chat message for conversation history
+ */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+/**
+ * Chat session for persistent KV cache across multiple messages
+ * Enables fast follow-up messages by only prefilling new tokens
+ */
+export interface ChatSession {
+  id: string;
+  messages: ChatMessage[];           // Full conversation history
+  cachedTokenIds: number[];          // Token IDs already in KV cache
+  cachedSeqLen: number;              // How many tokens are cached
+  createdAt: number;
+}
+
+/**
+ * Options for creating a chat session
+ */
+export interface ChatSessionOptions {
+  systemPrompt?: string;             // Optional system prompt to prepend
+}
+
+/**
  * WebGPU-accelerated inference engine
  */
 export class WebGPUEngine extends EventEmitter implements Engine {
@@ -112,9 +143,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   // GPU-resident KV cache for efficient incremental generation
   private kvCache: GPUKVCache | null = null;
 
+  // Active chat session for KV cache persistence across messages
+  private activeSession: ChatSession | null = null;
+
+  private dawnToggles?: string[];
+
   constructor(options: WebGPUEngineOptions = {}) {
     super();
     this.debugMode = options.debug ?? false;
+    this.dawnToggles = options.dawnToggles;
+    setDebugEnabled(this.debugMode);
   }
 
   /**
@@ -132,6 +170,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     this.gpuDevice = await initWebGPU({
       powerPreference: 'high-performance',
+      dawnToggles: this.dawnToggles,
     });
 
     this.initialized = true;
@@ -153,7 +192,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     try {
       // Parse GGUF file with full tokenizer data (no array size limit)
-      console.log('Parsing GGUF file with tokenizer data...');
+      debugLog('Parsing GGUF file with tokenizer data...');
       this.ggufFile = await parseGGUFWithTokenizer(modelPath);
       this.architecture = extractArchitecture(this.ggufFile);
 
@@ -163,8 +202,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // Initialize tokenizer from GGUF metadata
       try {
         this.tokenizer = Tokenizer.fromGGUF(this.ggufFile);
-        console.log(`Tokenizer loaded: ${this.tokenizer.vocabSize} tokens`);
-        console.log(`Special tokens: BOS=${this.tokenizer.bosTokenId}, EOS=${this.tokenizer.eosTokenId}`);
+        debugLog(`Tokenizer loaded: ${this.tokenizer.vocabSize} tokens`);
+        debugLog(`Special tokens: BOS=${this.tokenizer.bosTokenId}, EOS=${this.tokenizer.eosTokenId}`);
       } catch (tokenizerError) {
         console.warn('Could not load tokenizer from GGUF:', tokenizerError);
         this.tokenizer = null;
@@ -176,22 +215,25 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
       if (ggufTemplate) {
         this.chatTemplate = ggufTemplate;
-        console.log('Chat template loaded from GGUF metadata (Jinja2 format)');
+        debugLog('Chat template loaded from GGUF metadata (Jinja2 format)');
       } else if (arch === 'qwen2' || arch === 'qwen') {
         // Fallback Qwen2 template if not in GGUF
         this.chatTemplate = '{% for message in messages %}{% if message.role == "user" %}<|im_start|>user\n{{ message.content }}<|im_end|>\n<|im_start|>assistant\n{% endif %}{% endfor %}';
-        console.log('Using fallback Qwen2 chat template');
+        debugLog('Using fallback Qwen2 chat template');
       } else if (arch === 'llama' || arch === 'llama2') {
         // Fallback Llama 2 template
         this.chatTemplate = '{% for message in messages %}{% if message.role == "user" %}[INST] {{ message.content }} [/INST]{% endif %}{% endfor %}';
-        console.log('Using fallback Llama2 chat template');
+        debugLog('Using fallback Llama2 chat template');
       } else {
         this.chatTemplate = null;
-        console.log('No chat template configured - prompts will be used as-is');
+        debugLog('No chat template configured - prompts will be used as-is');
       }
 
       // Load weights to GPU
       await this.loadWeights(modelPath, options);
+
+      // Warm up shader pipelines to avoid JIT compilation spike on first token
+      await this.warmupShaders();
 
       this.modelLoaded = true;
       this.emit('loaded', {
@@ -239,8 +281,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
     }
 
-    console.log(`Model config: hidden=${this.hiddenSize}, heads=${this.numHeads}, kv_heads=${this.numKVHeads}, layers=${this.numLayers}`);
-    console.log(`RoPE base=${this.ropeBase}, RMS norm eps=${this.rmsNormEps}`);
+    debugLog(`Model config: hidden=${this.hiddenSize}, heads=${this.numHeads}, kv_heads=${this.numKVHeads}, layers=${this.numLayers}`);
+    debugLog(`RoPE base=${this.ropeBase}, RMS norm eps=${this.rmsNormEps}`);
   }
 
   /**
@@ -254,14 +296,14 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     // Estimate memory requirements
     const estimatedMemory = estimateModelMemory(this.ggufFile, true);
     const memoryMB = Math.round(estimatedMemory / (1024 * 1024));
-    console.log(`Loading model: ${this.numLayers} layers, ${this.hiddenSize} hidden size`);
-    console.log(`Estimated GPU memory: ${memoryMB} MB`);
+    debugLog(`Loading model: ${this.numLayers} layers, ${this.hiddenSize} hidden size`);
+    debugLog(`Estimated GPU memory: ${memoryMB} MB`);
 
     // Check if we have enough GPU memory (if capabilities available)
     const caps = this.gpuDevice?.getCapabilities();
     if (caps && caps.maxBufferSize) {
       const maxBufferMB = Math.round(caps.maxBufferSize / (1024 * 1024));
-      console.log(`Max GPU buffer size: ${maxBufferMB} MB`);
+      debugLog(`Max GPU buffer size: ${maxBufferMB} MB`);
     }
 
     try {
@@ -273,7 +315,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       });
 
       if (keepQuantized) {
-        console.log('Keeping weights in quantized format (reduced VRAM mode)');
+        debugLog('Keeping weights in quantized format (reduced VRAM mode)');
       }
 
       // Count loaded layers
@@ -281,8 +323,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         (l) => l.attnQ !== null
       ).length;
 
-      console.log(`Loaded ${loadedLayers} transformer layers`);
-      console.log('Weights loaded to GPU');
+      debugLog(`Loaded ${loadedLayers} transformer layers`);
+      debugLog('Weights loaded to GPU');
     } catch (error) {
       // Fallback to placeholder weights for testing without actual model files
       console.warn('Could not load model weights, using placeholders:', error);
@@ -294,7 +336,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
    * Load placeholder weights for testing
    */
   private async loadPlaceholderWeights(): Promise<void> {
-    console.log('Loading placeholder weights for testing');
+    debugLog('Loading placeholder weights for testing');
 
     this.weights = {
       tokenEmbedding: Tensor.random([this.vocabSize, this.hiddenSize], { label: 'embed_tokens' }),
@@ -322,7 +364,51 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       });
     }
 
-    console.log(`Placeholder weights loaded (${numTestLayers} layers)`);
+    debugLog(`Placeholder weights loaded (${numTestLayers} layers)`);
+  }
+
+  /**
+   * Warm up shader pipelines by running a minimal forward pass.
+   * Triggers JIT compilation of all unique compute shaders during model load
+   * instead of on the first user token, removing the first-token latency spike.
+   */
+  private async warmupShaders(): Promise<void> {
+    if (!this.weights) return;
+
+    console.log('Warming up shader pipelines...');
+    const warmupStart = performance.now();
+
+    try {
+      // Phase 1: Prefill with 2 tokens to trigger GEMM pipelines (batch path)
+      const prefillLogits = await this.forwardTensor([0, 1], true);
+      prefillLogits.destroy();
+      console.log('  GEMM pipelines compiled');
+
+      // Phase 2: Single incremental token to trigger GEMV pipelines (decode path)
+      const decodeLogits = await this.forwardTensor([0, 1, 2], true);
+      decodeLogits.destroy();
+      console.log('  GEMV pipelines compiled');
+    } catch (e) {
+      // Warmup errors are non-fatal — shaders will compile on first real use
+      console.warn(`[Warmup] Forward pass failed: ${e}`);
+    }
+
+    // Trigger top-K sampling pipeline compilation
+    try {
+      const dummyLogits = Tensor.random([1, this.vocabSize], { label: 'warmup_logits' });
+      await this.sampleTokenGPU(dummyLogits, 0.8, 40);
+      dummyLogits.destroy();
+      console.log('  Sampling pipeline compiled');
+    } catch (e) {
+      console.warn(`[Warmup] Sampling failed: ${e}`);
+    }
+
+    // Clean up warmup state
+    this.clearKVCache();
+    resetMatmulQDebugCount();
+
+    const warmupTime = performance.now() - warmupStart;
+    console.log(`Shader warmup complete in ${(warmupTime / 1000).toFixed(2)}s`);
   }
 
   /**
@@ -333,9 +419,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const numLayers = this.weights?.layers.length || this.numLayers;
     const kvDim = this.numKVHeads * this.headDim;
 
-    console.log(`[KVCache] Allocating GPU cache: ${numLayers} layers × ${maxSeqLen} tokens × ${kvDim} dim`);
+    debugLog(`[KVCache] Allocating GPU cache: ${numLayers} layers × ${maxSeqLen} tokens × ${kvDim} dim`);
     const memoryMB = (numLayers * 2 * maxSeqLen * kvDim * 4) / (1024 * 1024);
-    console.log(`[KVCache] Estimated memory: ${memoryMB.toFixed(1)} MB`);
+    debugLog(`[KVCache] Estimated memory: ${memoryMB.toFixed(1)} MB`);
 
     return {
       keys: Array(numLayers).fill(null).map((_, i) =>
@@ -400,7 +486,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const mean = n > 0 ? sum / n : 0;
     const variance = n > 0 ? (sumSq / n - mean * mean) : 0;
     const std = Math.sqrt(Math.max(0, variance));
-    console.log(`[Stats ${label}] n=${data.length}, mean=${mean.toFixed(6)}, std=${std.toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, nan=${nanCount}, inf=${infCount}, sum=${sum.toFixed(2)}`);
+    debugLog(`[Stats ${label}] n=${data.length}, mean=${mean.toFixed(6)}, std=${std.toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, nan=${nanCount}, inf=${infCount}, sum=${sum.toFixed(2)}`);
   }
 
   /**
@@ -430,7 +516,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       tokensToProcess = inputIds.slice(startPos);
       // Reduce logging noise - only log for multi-token incremental (speculation)
       if (tokensToProcess.length > 1) {
-        console.log(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos}`);
+        debugLog(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos}`);
       }
     } else {
       // Full mode: process all tokens (prefill)
@@ -445,7 +531,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         this.kvCache = this.createGPUKVCache(maxSeqLen);
       }
 
-      console.log(`[Forward] PREFILL: processing ${tokensToProcess.length} tokens`);
+      debugLog(`[Forward] PREFILL: processing ${tokensToProcess.length} tokens`);
     }
 
     const processLen = tokensToProcess.length;
@@ -454,7 +540,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     // Debug: log input token IDs for first call
     if (DEBUG) {
-      console.log(`[Forward] seqLen=${fullSeqLen}, first 5 tokens: [${inputIds.slice(0, 5).join(', ')}], last 5 tokens: [${inputIds.slice(-5).join(', ')}]`);
+      debugLog(`[Forward] seqLen=${fullSeqLen}, first 5 tokens: [${inputIds.slice(0, 5).join(', ')}], last 5 tokens: [${inputIds.slice(-5).join(', ')}]`);
     }
 
     // Create input embeddings only for tokens we need to process
@@ -471,8 +557,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         this.debugStats(embData, 'Embedding');
         const pos0 = Array.from(embData.slice(0, 5));
         const posLast = Array.from(embData.slice(-this.hiddenSize, -this.hiddenSize + 5));
-        console.log(`[Forward] Embedding pos 0: [${pos0.map((v: number) => v.toFixed(4)).join(', ')}]`);
-        console.log(`[Forward] Embedding pos ${processLen - 1}: [${posLast.map((v: number) => v.toFixed(4)).join(', ')}]`);
+        debugLog(`[Forward] Embedding pos 0: [${pos0.map((v: number) => v.toFixed(4)).join(', ')}]`);
+        debugLog(`[Forward] Embedding pos ${processLen - 1}: [${posLast.map((v: number) => v.toFixed(4)).join(', ')}]`);
       }
     } else {
       // Fallback to random embeddings (shouldn't happen with real model)
@@ -503,7 +589,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         const normedData = await normed.toArray();
         this.debugStats(normedData, 'L0 Normed');
         const sample = Array.from(normedData.slice(0, 8));
-        console.log(`[Layer0] Normed input (pos0): [${sample.map(v => v.toFixed(4)).join(', ')}]`);
+        debugLog(`[Layer0] Normed input (pos0): [${sample.map(v => v.toFixed(4)).join(', ')}]`);
       }
 
       // Self-attention with Q, K, V projections
@@ -523,20 +609,19 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         const attnData = await attnOut.toArray();
         this.debugStats(attnData, 'L0 AttnOut');
         const lastPosAttn = Array.from(attnData.slice(-this.hiddenSize, -this.hiddenSize + 8));
-        console.log(`[Layer0] Attn out last pos: [${lastPosAttn.map(v => v.toFixed(4)).join(', ')}]`);
+        debugLog(`[Layer0] Attn out last pos: [${lastPosAttn.map(v => v.toFixed(4)).join(', ')}]`);
       }
 
-      // Residual connection
-      const afterAttn = await ops.add(hidden, attnOut);
+      // Fused residual add + pre-FFN norm (saves one dispatch)
+      const { sum: afterAttn, normed: normed2 } = await addRmsNorm(
+        hidden, attnOut, layer.ffnNorm!, this.rmsNormEps
+      );
       hidden.destroy();
       if (attnOut !== normed) {
         normed.destroy();
         attnOut.destroy();
       }
       hidden = afterAttn;
-
-      // Pre-FFN norm
-      const normed2 = await rmsNorm(hidden, layer.ffnNorm, this.rmsNormEps);
 
       // FFN (use weights if available, otherwise skip)
       // GGUF weights are [in_features, out_features], correct for x @ W
@@ -554,7 +639,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
           const ffnData = await ffnOut.toArray();
           this.debugStats(ffnData, 'L0 FFNOut');
           const lastPosFfn = Array.from(ffnData.slice(-this.hiddenSize, -this.hiddenSize + 8));
-          console.log(`[Layer0] FFN out last pos: [${lastPosFfn.map(v => v.toFixed(4)).join(', ')}]`);
+          debugLog(`[Layer0] FFN out last pos: [${lastPosFfn.map(v => v.toFixed(4)).join(', ')}]`);
         }
 
         // Residual connection
@@ -570,19 +655,19 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       if (layerIdx === 0 && DEBUG) {
         const hiddenData = await hidden.toArray();
         const lastPosHidden = Array.from(hiddenData.slice(-this.hiddenSize, -this.hiddenSize + 8));
-        console.log(`[Layer0] Hidden after layer: [${lastPosHidden.map(v => v.toFixed(4)).join(', ')}]`);
+        debugLog(`[Layer0] Hidden after layer: [${lastPosHidden.map(v => v.toFixed(4)).join(', ')}]`);
       }
     }
 
     if (isIncremental) {
-      console.log(`[Layers] attn=${totalAttnTime.toFixed(0)}ms, ffn=${totalFfnTime.toFixed(0)}ms`);
+      debugLog(`[Layers] attn=${totalAttnTime.toFixed(0)}ms, ffn=${totalFfnTime.toFixed(0)}ms`);
     }
 
     // Update KV cache sequence length after processing all layers
     if (useCache && this.kvCache) {
       this.kvCache.seqLen = startPos + processLen;
       if (DEBUG) {
-        console.log(`[KVCache] Updated seqLen to ${this.kvCache.seqLen}`);
+        debugLog(`[KVCache] Updated seqLen to ${this.kvCache.seqLen}`);
       }
     }
     timings['layers'] = performance.now() - t0;
@@ -607,7 +692,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       const lastTokenData = await lastTokenHidden.toArray();
       this.debugStats(lastTokenData, 'Final Hidden');
       const lastPosVals = Array.from(lastTokenData.slice(0, 8));
-      console.log(`[Final] Last token hidden: [${lastPosVals.map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`[Final] Last token hidden: [${lastPosVals.map(v => v.toFixed(4)).join(', ')}]`);
     }
 
     finalNormed.destroy();
@@ -623,7 +708,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       if (DEBUG) {
         const logitsArr = await logits.toArray();
         this.debugStats(logitsArr, 'Logits');
-        console.log(`[DEBUG] Logit[0] = ${logitsArr[0].toFixed(4)}, logit[1] = ${logitsArr[1].toFixed(4)}`);
+        debugLog(`[DEBUG] Logit[0] = ${logitsArr[0].toFixed(4)}, logit[1] = ${logitsArr[1].toFixed(4)}`);
       }
     } else {
       // No output weight, create random logits for testing
@@ -642,9 +727,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     // Print timing breakdown for incremental mode (to diagnose slowness)
     if (isIncremental) {
-      console.log(`[Timing] embed=${timings['embedding']?.toFixed(0) || '?'}ms, layers=${timings['layers']?.toFixed(0)}ms, norm=${timings['finalNorm']?.toFixed(0)}ms, slice=${timings['sliceLastRow']?.toFixed(0)}ms, outProj=${timings['outputProj']?.toFixed(0)}ms, toArray=${timings['toArray']?.toFixed(0)}ms`);
+      debugLog(`[Timing] embed=${timings['embedding']?.toFixed(0) || '?'}ms, layers=${timings['layers']?.toFixed(0)}ms, norm=${timings['finalNorm']?.toFixed(0)}ms, slice=${timings['sliceLastRow']?.toFixed(0)}ms, outProj=${timings['outputProj']?.toFixed(0)}ms, toArray=${timings['toArray']?.toFixed(0)}ms`);
     }
-    console.log(`[Forward] ${isIncremental ? 'INCREMENTAL' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
+    debugLog(`[Forward] ${isIncremental ? 'INCREMENTAL' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
 
     return logitsData;
   }
@@ -654,6 +739,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
    * Used for GPU-accelerated sampling to avoid expensive toArray()
    * Caller is responsible for destroying the returned tensor!
    */
+  // Counter for periodic profiling of incremental forward passes
+  private forwardTensorCount = 0;
+
   private async forwardTensor(inputIds: number[], useCache = false): Promise<Tensor> {
     if (!this.weights) {
       throw new Error('Model weights not loaded');
@@ -682,15 +770,23 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     const processLen = tokensToProcess.length;
 
+    // Profile every 5th incremental token for visibility
+    const shouldProfile = isIncremental && processLen === 1 && (this.forwardTensorCount % 5 === 0);
+    let tProf: number = 0;
+    const prof: Record<string, number> = {};
+
     // Create input embeddings only for tokens we need to process
+    if (shouldProfile) tProf = performance.now();
     let hidden: Tensor;
     if (this.weights.tokenEmbedding) {
       hidden = await ops.embeddingLookup(this.weights.tokenEmbedding, tokensToProcess, this.vocabSize);
     } else {
       hidden = Tensor.random([processLen, this.hiddenSize], { label: 'hidden' });
     }
+    if (shouldProfile) prof['embed'] = performance.now() - tProf;
 
     // Process through all layers
+    if (shouldProfile) tProf = performance.now();
     for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
       const layer = this.weights.layers[layerIdx];
       if (!layer.attnNorm || !layer.ffnNorm) continue;
@@ -706,17 +802,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         attnOut = normed;
       }
 
-      // Residual connection
-      const afterAttn = await ops.add(hidden, attnOut);
+      // Fused residual add + pre-FFN norm (saves one dispatch)
+      const { sum: afterAttn, normed: normed2 } = await addRmsNorm(
+        hidden, attnOut, layer.ffnNorm!, this.rmsNormEps
+      );
       hidden.destroy();
       if (attnOut !== normed) {
         normed.destroy();
         attnOut.destroy();
       }
       hidden = afterAttn;
-
-      // Pre-FFN norm
-      const normed2 = await rmsNorm(hidden, layer.ffnNorm, this.rmsNormEps);
 
       // FFN
       if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
@@ -728,6 +823,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       }
       normed2.destroy();
     }
+    if (shouldProfile) prof['layers'] = performance.now() - tProf;
 
     // Update KV cache sequence length
     if (useCache && this.kvCache) {
@@ -735,16 +831,21 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
 
     // Final norm
+    if (shouldProfile) tProf = performance.now();
     const normWeight = this.weights.outputNorm || Tensor.ones([this.hiddenSize]);
     const finalNormed = await rmsNorm(hidden, normWeight, this.rmsNormEps);
     hidden.destroy();
     if (!this.weights.outputNorm) normWeight.destroy();
+    if (shouldProfile) prof['finalNorm'] = performance.now() - tProf;
 
     // Extract last token's hidden state
+    if (shouldProfile) tProf = performance.now();
     const lastTokenHidden = await ops.sliceLastRow(finalNormed);
     finalNormed.destroy();
+    if (shouldProfile) prof['slice'] = performance.now() - tProf;
 
     // Output projection - returns logits Tensor (caller must destroy!)
+    if (shouldProfile) tProf = performance.now();
     let logits: Tensor;
     if (this.weights.outputWeight) {
       logits = await matmulQ(lastTokenHidden, this.weights.outputWeight);
@@ -752,12 +853,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       logits = Tensor.random([1, this.vocabSize], { label: 'logits' });
     }
     lastTokenHidden.destroy();
+    if (shouldProfile) prof['outProj'] = performance.now() - tProf;
 
     const totalTime = performance.now() - forwardStart;
     if (isIncremental && processLen === 1) {
-      // Light logging for single-token incremental
+      this.forwardTensorCount++;
+      if (shouldProfile) {
+        debugLog(`[ForwardTensor] INCR #${this.forwardTensorCount} ${totalTime.toFixed(0)}ms | embed=${prof['embed']?.toFixed(0)}ms layers=${prof['layers']?.toFixed(0)}ms norm=${prof['finalNorm']?.toFixed(0)}ms slice=${prof['slice']?.toFixed(0)}ms outProj=${prof['outProj']?.toFixed(0)}ms`);
+      }
     } else {
-      console.log(`[ForwardTensor] ${isIncremental ? 'INCR' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
+      debugLog(`[ForwardTensor] ${isIncremental ? 'INCR' : 'PREFILL'} took ${totalTime.toFixed(1)}ms for ${processLen} token(s)`);
     }
 
     return logits;
@@ -837,14 +942,13 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       );
       normed1.destroy();
 
-      // Residual connection
-      const afterAttn = await ops.add(hidden, attnOut);
+      // Fused residual add + pre-FFN norm (saves one dispatch)
+      const { sum: afterAttn, normed: normed2 } = await addRmsNorm(
+        hidden, attnOut, layer.ffnNorm!, this.rmsNormEps
+      );
       hidden.destroy();
       attnOut.destroy();
       hidden = afterAttn;
-
-      // Pre-FFN norm
-      const normed2 = await rmsNorm(hidden, layer.ffnNorm!, this.rmsNormEps);
 
       // Feed-forward
       const ffnOut = await feedForwardQ(
@@ -1019,9 +1123,9 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       this.debugStats(kData, 'K post-RoPE');
       const qAfterRope = Array.from(qData.slice(0, 8));
       const qLastPosAfter = Array.from(qData.slice(-this.numHeads * this.headDim, -this.numHeads * this.headDim + 8));
-      console.log(`[RoPE] Q pos0 before: [${qBeforeRope.map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`[RoPE] Q pos0 after:  [${qAfterRope.map(v => v.toFixed(4)).join(', ')}]`);
-      console.log(`[RoPE] Q pos${processLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`[RoPE] Q pos0 before: [${qBeforeRope.map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`[RoPE] Q pos0 after:  [${qAfterRope.map(v => v.toFixed(4)).join(', ')}]`);
+      debugLog(`[RoPE] Q pos${processLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
     }
 
     // Determine K/V to use for attention
@@ -1088,7 +1192,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     attnOut.destroy();
     if (shouldTime) {
       attnTimings['outProj'] = performance.now() - t0;
-      console.log(`[AttnL0] qkvProj=${attnTimings['qkvProj']?.toFixed(1)}ms biases=${attnTimings['biases']?.toFixed(1)}ms rope=${attnTimings['rope']?.toFixed(1)}ms copyRows=${attnTimings['copyRows']?.toFixed(1)}ms causalAttn=${attnTimings['causalAttn']?.toFixed(1)}ms outProj=${attnTimings['outProj']?.toFixed(1)}ms`);
+      debugLog(`[AttnL0] qkvProj=${attnTimings['qkvProj']?.toFixed(1)}ms biases=${attnTimings['biases']?.toFixed(1)}ms rope=${attnTimings['rope']?.toFixed(1)}ms copyRows=${attnTimings['copyRows']?.toFixed(1)}ms causalAttn=${attnTimings['causalAttn']?.toFixed(1)}ms outProj=${attnTimings['outProj']?.toFixed(1)}ms`);
     }
 
     return projected;
@@ -1389,19 +1493,19 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const tokensPerSecond = generatedTokens.length / genTimeSeconds;
     const tokensPerForward = generatedTokens.length / Math.max(1, forwardPasses);
 
-    console.log(`[Generate] ${generatedTokens.length} tokens in ${genTimeSeconds.toFixed(2)}s = ${tokensPerSecond.toFixed(1)} tok/s`);
-    console.log(`[Generate] ${forwardPasses} forward passes, ${tokensPerForward.toFixed(2)} tokens/forward (1.0 = no speculation benefit)`);
+    debugLog(`[Generate] ${generatedTokens.length} tokens in ${genTimeSeconds.toFixed(2)}s = ${tokensPerSecond.toFixed(1)} tok/s`);
+    debugLog(`[Generate] ${forwardPasses} forward passes, ${tokensPerForward.toFixed(2)} tokens/forward (1.0 = no speculation benefit)`);
 
     // Log speculative decoding statistics
     if (ngramCache) {
       const stats = ngramCache.getStats();
-      console.log(`[Speculative] hitRate=${(stats.hitRate * 100).toFixed(1)}%, acceptRate=${(stats.acceptanceRate * 100).toFixed(1)}%, accepted=${stats.acceptedTokens}/${stats.proposedTokens}`);
+      debugLog(`[Speculative] hitRate=${(stats.hitRate * 100).toFixed(1)}%, acceptRate=${(stats.acceptanceRate * 100).toFixed(1)}%, accepted=${stats.acceptedTokens}/${stats.proposedTokens}`);
     }
 
     // Log command batcher statistics
     const batcherStats = getCommandBatcherStats();
     if (batcherStats && batcherStats.totalBatches > 0) {
-      console.log(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
+      debugLog(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
     }
     resetCommandBatcherStats();
 
@@ -1445,6 +1549,405 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
+   * Apply chat template to format multiple messages (for session-based chat)
+   */
+  private applyChatTemplateForMessages(messages: ChatMessage[], addGenerationPrompt = true): string {
+    if (!this.chatTemplate) {
+      // Fallback: concatenate messages
+      return messages.map(m => `${m.role}: ${m.content}`).join('\n');
+    }
+
+    const context = {
+      messages,
+      add_generation_prompt: addGenerationPrompt,
+      bos_token: this.tokenizer?.getToken(this.tokenizer.bosTokenId) || '<s>',
+      eos_token: this.tokenizer?.getToken(this.tokenizer.eosTokenId) || '</s>',
+    };
+
+    try {
+      return nunjucksEnv.renderString(this.chatTemplate, context);
+    } catch (error) {
+      console.warn('Failed to render chat template:', error);
+      return messages.map(m => `${m.role}: ${m.content}`).join('\n');
+    }
+  }
+
+  /**
+   * Create a new chat session for persistent KV cache across messages
+   * This enables fast follow-up messages by only prefilling new tokens
+   */
+  createSession(options: ChatSessionOptions = {}): ChatSession {
+    // End any existing session
+    if (this.activeSession) {
+      this.endSession();
+    }
+
+    const session: ChatSession = {
+      id: `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      messages: [],
+      cachedTokenIds: [],
+      cachedSeqLen: 0,
+      createdAt: Date.now(),
+    };
+
+    // Add system prompt if provided
+    if (options.systemPrompt) {
+      session.messages.push({ role: 'system', content: options.systemPrompt });
+    }
+
+    this.activeSession = session;
+    debugLog(`[Session] Created session ${session.id}`);
+    return session;
+  }
+
+  /**
+   * End the current chat session and free KV cache
+   */
+  endSession(): void {
+    if (this.activeSession) {
+      debugLog(`[Session] Ending session ${this.activeSession.id}`);
+      this.activeSession = null;
+      this.clearKVCache();
+    }
+  }
+
+  /**
+   * Get the current active session (if any)
+   */
+  getActiveSession(): ChatSession | null {
+    return this.activeSession;
+  }
+
+  /**
+   * Chat within a session - preserves KV cache for fast follow-up messages
+   * Only prefills NEW tokens, reusing cached tokens from previous messages
+   */
+  async sessionChat(
+    message: string,
+    options: WebGPUGenerateOptions = {}
+  ): Promise<{ text: string; tokensGenerated: number; prefillTokens: number; cachedTokens: number }> {
+    if (!this.modelLoaded) {
+      throw new Error('Model not loaded');
+    }
+
+    // Create session if none exists
+    if (!this.activeSession) {
+      this.createSession();
+    }
+
+    const session = this.activeSession!;
+    const {
+      maxTokens = 256,
+      temperature = 0.8,
+      topK = 40,
+      stop = [],
+    } = options;
+
+    // Add user message to history
+    session.messages.push({ role: 'user', content: message });
+
+    // Format full conversation with chat template
+    const fullPrompt = this.applyChatTemplateForMessages(session.messages, true);
+
+    // Tokenize full conversation
+    let fullTokenIds: number[];
+    if (this.tokenizer) {
+      fullTokenIds = this.tokenizer.encode(fullPrompt);
+    } else {
+      fullTokenIds = Array.from(fullPrompt).map(c => c.charCodeAt(0) % this.vocabSize);
+    }
+
+    // Calculate which tokens are new (not yet in cache)
+    const cachedLen = session.cachedSeqLen;
+    const newTokenIds = fullTokenIds.slice(cachedLen);
+    const cachedTokens = cachedLen;
+    const prefillTokens = newTokenIds.length;
+
+    debugLog(`[Session] Full context: ${fullTokenIds.length} tokens, cached: ${cachedTokens}, new prefill: ${prefillTokens}`);
+
+    // Check if we need to reallocate cache (context overflow)
+    const totalNeeded = fullTokenIds.length + maxTokens;
+    if (this.kvCache && totalNeeded > this.kvCache.maxSeqLen) {
+      debugLog(`[Session] Context overflow: need ${totalNeeded}, max ${this.kvCache.maxSeqLen}. Clearing cache.`);
+      this.clearKVCache();
+      session.cachedTokenIds = [];
+      session.cachedSeqLen = 0;
+    }
+
+    // Allocate cache if needed (first message or after overflow)
+    if (!this.kvCache) {
+      const maxSeqLen = Math.max(this.contextLength, totalNeeded + 256);
+      this.kvCache = this.createGPUKVCache(maxSeqLen);
+      // Need to prefill from start
+      session.cachedTokenIds = [];
+      session.cachedSeqLen = 0;
+    }
+
+    // Prefill: forwardTensor will automatically use incremental mode if kvCache.seqLen > 0
+    // Pass full token sequence - it will only process tokens beyond kvCache.seqLen
+    if (fullTokenIds.length > (this.kvCache?.seqLen ?? 0)) {
+      const prefillStart = performance.now();
+      await this.forwardTensor(fullTokenIds, true);
+      const prefillTime = performance.now() - prefillStart;
+      debugLog(`[Session] Prefill took ${prefillTime.toFixed(1)}ms for ${prefillTokens} new tokens (cache had ${cachedTokens})`);
+    }
+
+    // Update cached state
+    session.cachedTokenIds = fullTokenIds.slice();
+    session.cachedSeqLen = fullTokenIds.length;
+
+    // Now generate response tokens
+    const generatedTokens: number[] = [];
+    let generatedText = '';
+    const eosId = this.tokenizer?.eosTokenId ?? 2;
+    const genStart = performance.now();
+
+    while (generatedTokens.length < maxTokens) {
+      // Get all token IDs including generated ones
+      const allIds = [...session.cachedTokenIds, ...generatedTokens];
+
+      // Forward pass for next token
+      const logitsTensor = await this.forwardTensor(allIds, true);
+      const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+      logitsTensor.destroy();
+
+      generatedTokens.push(nextToken);
+
+      // Decode token
+      let tokenText: string;
+      if (this.tokenizer) {
+        tokenText = this.tokenizer.decodeToken(nextToken);
+      } else {
+        tokenText = String.fromCharCode(nextToken % 128);
+      }
+      generatedText += tokenText;
+
+      // Check for EOS
+      if (nextToken === eosId) break;
+
+      // Check for stop sequences
+      let shouldStop = false;
+      for (const stopSeq of stop) {
+        if (generatedText.endsWith(stopSeq)) {
+          generatedText = generatedText.slice(0, -stopSeq.length);
+          shouldStop = true;
+          break;
+        }
+      }
+      if (shouldStop) break;
+    }
+
+    const genTime = performance.now() - genStart;
+    const tokPerSec = generatedTokens.length / (genTime / 1000);
+    debugLog(`[Session] Generated ${generatedTokens.length} tokens in ${genTime.toFixed(0)}ms (${tokPerSec.toFixed(1)} tok/s)`);
+
+    // Add assistant response to history
+    session.messages.push({ role: 'assistant', content: generatedText });
+
+    // Update cache to include generated tokens
+    session.cachedTokenIds.push(...generatedTokens);
+    session.cachedSeqLen += generatedTokens.length;
+
+    return {
+      text: generatedText,
+      tokensGenerated: generatedTokens.length,
+      prefillTokens,
+      cachedTokens,
+    };
+  }
+
+  /**
+   * OpenAI/Claude-compatible chat completion API
+   * Takes full messages array and intelligently caches conversation prefix
+   *
+   * @example
+   * ```typescript
+   * const result = await engine.chatCompletion({
+   *   messages: [
+   *     { role: 'system', content: 'You are helpful' },
+   *     { role: 'user', content: 'Hello!' },
+   *     { role: 'assistant', content: 'Hi there!' },
+   *     { role: 'user', content: 'How are you?' }  // Only this gets prefilled on follow-up
+   *   ],
+   *   maxTokens: 256,
+   *   temperature: 0.7
+   * });
+   * ```
+   */
+  async chatCompletion(options: {
+    messages: ChatMessage[];
+    maxTokens?: number;
+    temperature?: number;
+    topK?: number;
+    topP?: number;
+    stop?: string[];
+  }): Promise<{
+    message: ChatMessage;
+    tokensGenerated: number;
+    prefillTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+  }> {
+    if (!this.modelLoaded) {
+      throw new Error('Model not loaded');
+    }
+
+    const {
+      messages,
+      maxTokens = 256,
+      temperature = 0.8,
+      topK = 40,
+      stop = [],
+    } = options;
+
+    if (!messages || messages.length === 0) {
+      throw new Error('Messages array cannot be empty');
+    }
+
+    // Format conversation with chat template
+    const fullPrompt = this.applyChatTemplateForMessages(messages, true);
+
+    // Tokenize full conversation
+    let fullTokenIds: number[];
+    if (this.tokenizer) {
+      fullTokenIds = this.tokenizer.encode(fullPrompt);
+    } else {
+      fullTokenIds = Array.from(fullPrompt).map(c => c.charCodeAt(0) % this.vocabSize);
+    }
+
+    // Check if we can reuse cached tokens
+    // Compare token prefix to detect continuation vs new conversation
+    let cachedTokens = 0;
+
+    if (this.kvCache && this.activeSession && this.kvCache.seqLen > 0) {
+      // Check how many tokens match the cached prefix
+      const cachedIds = this.activeSession.cachedTokenIds;
+      let matchLen = 0;
+      for (let i = 0; i < Math.min(cachedIds.length, fullTokenIds.length); i++) {
+        if (cachedIds[i] === fullTokenIds[i]) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+
+      // If significant prefix matches, reuse cache
+      if (matchLen > 0 && matchLen >= cachedIds.length * 0.8) {
+        // Good match - reuse cache up to matchLen
+        cachedTokens = Math.min(matchLen, this.kvCache.seqLen);
+        debugLog(`[ChatCompletion] Cache hit: ${cachedTokens}/${fullTokenIds.length} tokens matched`);
+      } else if (matchLen < cachedIds.length * 0.5) {
+        // Poor match - new conversation, clear cache
+        debugLog(`[ChatCompletion] Cache miss: only ${matchLen}/${cachedIds.length} tokens matched, clearing cache`);
+        this.clearKVCache();
+        if (this.activeSession) {
+          this.activeSession.cachedTokenIds = [];
+          this.activeSession.cachedSeqLen = 0;
+        }
+      }
+    }
+
+    const prefillTokens = fullTokenIds.length - cachedTokens;
+    debugLog(`[ChatCompletion] Total: ${fullTokenIds.length} tokens, cached: ${cachedTokens}, prefill: ${prefillTokens}`);
+
+    // Ensure we have a session for tracking
+    if (!this.activeSession) {
+      this.createSession();
+    }
+
+    // Allocate or check cache capacity
+    const totalNeeded = fullTokenIds.length + maxTokens;
+    if (!this.kvCache || totalNeeded > this.kvCache.maxSeqLen) {
+      if (this.kvCache) {
+        debugLog(`[ChatCompletion] Cache overflow, reallocating`);
+        this.clearKVCache();
+      }
+      const maxSeqLen = Math.max(this.contextLength, totalNeeded + 256);
+      this.kvCache = this.createGPUKVCache(maxSeqLen);
+      cachedTokens = 0; // Must prefill everything
+    }
+
+    // Prefill if needed
+    if (fullTokenIds.length > (this.kvCache?.seqLen ?? 0)) {
+      const prefillStart = performance.now();
+      await this.forwardTensor(fullTokenIds, true);
+      const prefillTime = performance.now() - prefillStart;
+      debugLog(`[ChatCompletion] Prefill took ${prefillTime.toFixed(1)}ms`);
+    }
+
+    // Update session state
+    this.activeSession!.messages = [...messages];
+    this.activeSession!.cachedTokenIds = fullTokenIds.slice();
+    this.activeSession!.cachedSeqLen = fullTokenIds.length;
+
+    // Generate response
+    const generatedTokens: number[] = [];
+    let generatedText = '';
+    const eosId = this.tokenizer?.eosTokenId ?? 2;
+    const genStart = performance.now();
+
+    while (generatedTokens.length < maxTokens) {
+      const tTok = performance.now();
+      const allIds = [...fullTokenIds, ...generatedTokens];
+
+      const tFwd = performance.now();
+      const logitsTensor = await this.forwardTensor(allIds, true);
+      const fwdTime = performance.now() - tFwd;
+
+      const tSamp = performance.now();
+      const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+      const sampTime = performance.now() - tSamp;
+      logitsTensor.destroy();
+
+      const tokTime = performance.now() - tTok;
+
+      // Log timing for every 5th token
+      if (generatedTokens.length % 5 === 0) {
+        debugLog(`[Token#${generatedTokens.length}] total=${tokTime.toFixed(0)}ms fwd=${fwdTime.toFixed(0)}ms sample=${sampTime.toFixed(0)}ms`);
+      }
+
+      generatedTokens.push(nextToken);
+
+      let tokenText: string;
+      if (this.tokenizer) {
+        tokenText = this.tokenizer.decodeToken(nextToken);
+      } else {
+        tokenText = String.fromCharCode(nextToken % 128);
+      }
+      generatedText += tokenText;
+
+      if (nextToken === eosId) break;
+
+      let shouldStop = false;
+      for (const stopSeq of stop) {
+        if (generatedText.endsWith(stopSeq)) {
+          generatedText = generatedText.slice(0, -stopSeq.length);
+          shouldStop = true;
+          break;
+        }
+      }
+      if (shouldStop) break;
+    }
+
+    const genTime = performance.now() - genStart;
+    const tokPerSec = generatedTokens.length / (genTime / 1000);
+    debugLog(`[ChatCompletion] Generated ${generatedTokens.length} tokens in ${genTime.toFixed(0)}ms (${tokPerSec.toFixed(1)} tok/s)`);
+
+    // Update cache with generated tokens
+    this.activeSession!.cachedTokenIds.push(...generatedTokens);
+    this.activeSession!.cachedSeqLen += generatedTokens.length;
+    this.activeSession!.messages.push({ role: 'assistant', content: generatedText });
+
+    return {
+      message: { role: 'assistant', content: generatedText },
+      tokensGenerated: generatedTokens.length,
+      prefillTokens,
+      cachedTokens,
+      totalTokens: fullTokenIds.length + generatedTokens.length,
+    };
+  }
+
+  /**
    * Generate text with streaming and GPU-resident KV cache for O(n) generation
    */
   async *generateStream(
@@ -1477,14 +1980,14 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const formattedPrompt = rawPrompt ? prompt : this.applyChatTemplate(prompt);
 
     if (!rawPrompt && this.chatTemplate) {
-      console.log(`[Chat] Using chat template, formatted prompt length: ${formattedPrompt.length}`);
+      debugLog(`[Chat] Using chat template, formatted prompt length: ${formattedPrompt.length}`);
     }
 
     // Tokenize input
     let inputIds: number[];
     if (this.tokenizer) {
       inputIds = this.tokenizer.encode(formattedPrompt);
-      console.log(`[Chat] Tokenized prompt: ${inputIds.length} tokens`);
+      debugLog(`[Chat] Tokenized prompt: ${inputIds.length} tokens`);
     } else {
       inputIds = Array.from(formattedPrompt).map((c) => c.charCodeAt(0) % this.vocabSize);
     }
@@ -1516,18 +2019,29 @@ export class WebGPUEngine extends EventEmitter implements Engine {
             indexed.sort((a, b) => b.v - a.v);
             const top5 = indexed.slice(0, 5);
 
-            console.log(`[Gen ${i}] Logits: min=${minLogit.toFixed(2)}, max=${maxLogit.toFixed(2)}, mean=${mean.toFixed(4)}`);
-            console.log(`[Gen ${i}] Top 5: ${top5.map(t => `${t.idx}(${t.v.toFixed(2)})`).join(', ')}`);
+            debugLog(`[Gen ${i}] Logits: min=${minLogit.toFixed(2)}, max=${maxLogit.toFixed(2)}, mean=${mean.toFixed(4)}`);
+            debugLog(`[Gen ${i}] Top 5: ${top5.map(t => `${t.idx}(${t.v.toFixed(2)})`).join(', ')}`);
             if (this.tokenizer) {
-              console.log(`[Gen ${i}] Top 5 tokens: ${top5.map(t => this.tokenizer!.getToken(t.idx)).join(', ')}`);
+              debugLog(`[Gen ${i}] Top 5 tokens: ${top5.map(t => this.tokenizer!.getToken(t.idx)).join(', ')}`);
             }
           }
           nextToken = this.sampleToken(logits, temperature, topK);
         } else {
           // Normal mode: GPU-accelerated sampling (avoids expensive toArray)
+          const tTokStream = performance.now();
           const logitsTensor = await this.forwardTensor(allIds, true);
+          const fwdTimeStream = performance.now() - tTokStream;
+
+          const tSampStream = performance.now();
           nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+          const sampTimeStream = performance.now() - tSampStream;
           logitsTensor.destroy();
+
+          const tokTimeStream = performance.now() - tTokStream;
+          // Log timing for every 5th token
+          if (i % 5 === 0) {
+            debugLog(`[Stream#${i}] total=${tokTimeStream.toFixed(0)}ms fwd=${fwdTimeStream.toFixed(0)}ms sample=${sampTimeStream.toFixed(0)}ms`);
+          }
         }
 
         generatedTokens.push(nextToken);
@@ -1568,7 +2082,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // Log command batcher statistics
       const batcherStats = getCommandBatcherStats();
       if (batcherStats && batcherStats.totalBatches > 0) {
-        console.log(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
+        debugLog(`[Batcher] ${batcherStats.totalBatches} batches, ${batcherStats.totalPasses} passes, avg ${batcherStats.avgPassesPerBatch.toFixed(1)} passes/batch`);
       }
       resetCommandBatcherStats();
     }
@@ -1612,8 +2126,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       throw new Error('Model not loaded for benchmark');
     }
 
-    console.log('\n========== GPU SCALING BENCHMARK ==========');
-    console.log('Measuring forward pass time with different token counts...\n');
+    debugLog('\n========== GPU SCALING BENCHMARK ==========');
+    debugLog('Measuring forward pass time with different token counts...\n');
 
     // Create a dummy prompt
     const dummyTokens = Array.from({ length: 512 }, (_, i) => i % this.vocabSize);
@@ -1645,29 +2159,29 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       const tokPerSec = (numTokens / avgTime) * 1000;
 
       results.push({ tokens: numTokens, timeMs: avgTime, tokPerSec });
-      console.log(`${numTokens.toString().padStart(3)} tokens: ${avgTime.toFixed(1)}ms (${tokPerSec.toFixed(0)} tok/s)`);
+      debugLog(`${numTokens.toString().padStart(3)} tokens: ${avgTime.toFixed(1)}ms (${tokPerSec.toFixed(0)} tok/s)`);
     }
 
     // Analyze scaling
-    console.log('\n--- SCALING ANALYSIS ---');
+    debugLog('\n--- SCALING ANALYSIS ---');
     const baseline = results[0];
     for (const r of results.slice(1)) {
       const actualRatio = r.timeMs / baseline.timeMs;
       const efficiency = r.tokens / actualRatio;
-      console.log(`${r.tokens} tokens: ${actualRatio.toFixed(1)}x time for ${r.tokens}x tokens → ${efficiency.toFixed(1)}x effective parallelism`);
+      debugLog(`${r.tokens} tokens: ${actualRatio.toFixed(1)}x time for ${r.tokens}x tokens → ${efficiency.toFixed(1)}x effective parallelism`);
     }
 
     // Recommendation
     const best = results.reduce((a, b) => a.tokPerSec > b.tokPerSec ? a : b);
-    console.log(`\n✓ OPTIMAL: ${best.tokens} tokens (${best.tokPerSec.toFixed(0)} tok/s)`);
+    debugLog(`\n✓ OPTIMAL: ${best.tokens} tokens (${best.tokPerSec.toFixed(0)} tok/s)`);
 
     if (best.tokens > 16) {
-      console.log('→ GPU parallelism IS helping. Tree speculation will improve speed.');
+      debugLog('→ GPU parallelism IS helping. Tree speculation will improve speed.');
     } else {
-      console.log('→ GPU is memory-bound. More tokens won\'t help much.');
+      debugLog('→ GPU is memory-bound. More tokens won\'t help much.');
     }
 
-    console.log('==========================================\n');
+    debugLog('==========================================\n');
 
     // Clean up
     this.clearKVCache();

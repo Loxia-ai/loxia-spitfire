@@ -6,6 +6,7 @@
 /// <reference types="@webgpu/types" />
 
 import { getWebGPUDevice } from './device.js';
+import { getGPUProfiler } from './perf/gpu-profiler.js';
 
 export interface ComputePipelineOptions {
   label?: string;
@@ -364,7 +365,18 @@ export function dispatchCompute(
   const device = getWebGPUDevice().getDevice();
 
   const encoder = device.createCommandEncoder({ label });
-  const pass = encoder.beginComputePass({ label });
+
+  // Inject GPU timestamp writes if profiler is active
+  const profiler = getGPUProfiler();
+  const opLabel = label || pipeline.label || 'unnamed';
+  const timestampWrites = profiler.isEnabled() ? profiler.beginOperation(opLabel) : null;
+
+  const passDescriptor: GPUComputePassDescriptor = { label };
+  if (timestampWrites) {
+    passDescriptor.timestampWrites = timestampWrites;
+  }
+
+  const pass = encoder.beginComputePass(passDescriptor);
 
   pass.setPipeline(pipeline);
   for (let i = 0; i < bindGroups.length; i++) {

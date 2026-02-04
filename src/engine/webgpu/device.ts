@@ -23,6 +23,8 @@ export interface DeviceOptions {
   powerPreference?: 'low-power' | 'high-performance';
   requiredFeatures?: GPUFeatureName[];
   requiredLimits?: Record<string, number>;
+  /** Dawn backend toggles (Node.js only). E.g. ['disable_timestamp_query_conversion'] */
+  dawnToggles?: string[];
 }
 
 /**
@@ -69,7 +71,7 @@ export class WebGPUDevice {
   /**
    * Get the GPU object (handles Node.js vs browser)
    */
-  private static async getGPU(): Promise<GPU | null> {
+  private static async getGPU(dawnToggles?: string[]): Promise<GPU | null> {
     // Try browser global first
     if (typeof globalThis !== 'undefined' && 'navigator' in globalThis) {
       const nav = (globalThis as { navigator?: { gpu?: GPU } }).navigator;
@@ -82,7 +84,8 @@ export class WebGPUDevice {
     try {
       const webgpu = await import('webgpu');
       // The webgpu package creates a GPU instance
-      const gpu = webgpu.create([]);
+      // Dawn toggles can be passed here (e.g. ['disable_timestamp_query_conversion'])
+      const gpu = webgpu.create(dawnToggles || []);
       return gpu as GPU;
     } catch {
       return null;
@@ -109,7 +112,7 @@ export class WebGPUDevice {
 
   private async doInit(options: DeviceOptions): Promise<void> {
     // Get GPU
-    this.gpu = await WebGPUDevice.getGPU();
+    this.gpu = await WebGPUDevice.getGPU(options.dawnToggles);
     if (!this.gpu) {
       throw new Error('WebGPU not available in this environment');
     }
@@ -146,8 +149,14 @@ export class WebGPUDevice {
       }
     }
 
+    // Request timestamp-query if adapter supports it (for GPU profiling)
+    const features: GPUFeatureName[] = [...(options.requiredFeatures || [])];
+    if (this.adapter.features.has('timestamp-query') && !features.includes('timestamp-query')) {
+      features.push('timestamp-query');
+    }
+
     this.device = await this.adapter.requestDevice({
-      requiredFeatures: options.requiredFeatures || [],
+      requiredFeatures: features,
       requiredLimits,
     });
 

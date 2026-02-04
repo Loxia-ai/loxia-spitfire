@@ -68,12 +68,14 @@ export * as ops from './ops/index.js';
 export {
   layerNorm,
   rmsNorm,
+  addRmsNorm,
   applyRope,
   attention,
   feedForward,
   feedForwardQ,
   matmulQ,
   mlp,
+  resetMatmulQDebugCount,
   type AttentionConfig,
   type WeightTensor as LayerWeightTensor,
 } from './layers/index.js';
@@ -128,4 +130,10 @@ export {
   type PerfMetrics,
   type PerfStats,
   type WorkgroupConfig,
+  GPUProfiler,
+  getGPUProfiler,
+  enableGPUProfiling,
+  disableGPUProfiling,
+  destroyGPUProfiler,
+  type ProfileResult,
 } from './perf/index.js';

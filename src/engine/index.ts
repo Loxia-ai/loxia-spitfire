@@ -12,7 +12,14 @@ export type {
 } from './wasm-engine.js';
 
 export { WebGPUEngine, createWebGPUEngine } from './webgpu-engine.js';
-export type { WebGPUEngineOptions } from './webgpu-engine.js';
+export type {
+  WebGPUEngineOptions,
+  WebGPUGenerateOptions,
+  WebGPULoadModelOptions,
+  ChatMessage,
+  ChatSession,
+  ChatSessionOptions,
+} from './webgpu-engine.js';
 
 import { WasmEngine, type WasmEngineOptions } from './wasm-engine.js';
 import { WebGPUEngine, type WebGPUEngineOptions } from './webgpu-engine.js';
