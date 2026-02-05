@@ -1457,10 +1457,21 @@ export async function gemvQ6_K(
 // ============================================================================
 
 const Q6_K_GEMM_TILED_SHADER = `
-// Tiled Q6_K GEMM: Y = X @ W_q6k
+// Heavily Optimized Tiled Q6_K GEMM: Y = X @ W_q6k
 // X: f32 [M, K]
 // W: Q6_K quantized [K, N], stored as raw bytes
 // Y: f32 [M, N]
+//
+// Key optimizations:
+// 1. Cache block header (d, scales) in registers, refresh every 8 K-tiles
+// 2. Batch read_4bytes() for ql, qh values
+// 3. Pre-compute d*scale products for all 16 scales
+//
+// Q6_K Block Format (210 bytes per 256 elements):
+// - ql[128] at offset 0: low 4 bits
+// - qh[64] at offset 128: high 2 bits packed
+// - scales[16] at offset 192: signed int8
+// - d at offset 208: f16
 
 struct Params {
   M: u32,
@@ -1474,20 +1485,25 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-const BLOCK_SIZE: u32 = 256u;
 const BYTES_PER_BLOCK: u32 = 210u;
 const TILE_M: u32 = 8u;
 const TILE_N: u32 = 64u;
 const TILE_K: u32 = 32u;
 
-// Shared memory for dequantized weights and input tile
 var<workgroup> sharedW: array<f32, 2048>;  // TILE_N * TILE_K = 64 * 32
 var<workgroup> sharedX: array<f32, 256>;   // TILE_M * TILE_K = 8 * 32
 
-fn read_byte(byteOffset: u32) -> u32 {
+fn read_4bytes(byteOffset: u32) -> u32 {
   let u32Idx = byteOffset >> 2u;
   let byteInU32 = byteOffset & 3u;
-  return (W_quant[u32Idx] >> (byteInU32 << 3u)) & 0xFFu;
+  if (byteInU32 == 0u) {
+    return W_quant[u32Idx];
+  } else {
+    let shift = byteInU32 << 3u;
+    let lo = W_quant[u32Idx] >> shift;
+    let hi = W_quant[u32Idx + 1u] << (32u - shift);
+    return lo | hi;
+  }
 }
 
 fn read_u16(byteOffset: u32) -> u32 {
@@ -1522,51 +1538,6 @@ fn int8_to_i32(v: u32) -> i32 {
   return i32(v << 24u) >> 24;
 }
 
-// Dequantize Q6_K weight at position (k, n)
-fn dequant_q6k(k: u32, n: u32, K: u32) -> f32 {
-  let linearIdx = n * K + k;
-  let blockIdx = linearIdx >> 8u;
-  let posInBlock = linearIdx & 255u;
-  let blockByteOffset = blockIdx * BYTES_PER_BLOCK;
-
-  let dOffset = blockByteOffset + 208u;
-  let d = f16_to_f32(read_u16(dOffset));
-
-  let chunk = posInBlock >> 7u;
-  let posInChunk = posInBlock & 127u;
-  let quadrant = posInChunk >> 5u;
-  let l = posInChunk & 31u;
-
-  let qlBase = blockByteOffset + chunk * 64u;
-  let qhBase = blockByteOffset + 128u + chunk * 32u;
-  let scBase = blockByteOffset + 128u + 64u + chunk * 8u;
-
-  let ql_l0 = read_byte(qlBase + l);
-  let ql_l32 = read_byte(qlBase + l + 32u);
-  let qh_l = read_byte(qhBase + l);
-
-  var q: i32;
-  var scaleIdx: u32;
-  let is = l >> 4u;
-
-  if (quadrant == 0u) {
-    q = i32((ql_l0 & 0xFu) | (((qh_l >> 0u) & 3u) << 4u)) - 32;
-    scaleIdx = is + 0u;
-  } else if (quadrant == 1u) {
-    q = i32((ql_l32 & 0xFu) | (((qh_l >> 2u) & 3u) << 4u)) - 32;
-    scaleIdx = is + 2u;
-  } else if (quadrant == 2u) {
-    q = i32((ql_l0 >> 4u) | (((qh_l >> 4u) & 3u) << 4u)) - 32;
-    scaleIdx = is + 4u;
-  } else {
-    q = i32((ql_l32 >> 4u) | (((qh_l >> 6u) & 3u) << 4u)) - 32;
-    scaleIdx = is + 6u;
-  }
-
-  let sc = int8_to_i32(read_byte(scBase + scaleIdx));
-  return d * f32(sc) * f32(q);
-}
-
 @compute @workgroup_size(64)
 fn main(
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -1591,55 +1562,137 @@ fn main(
   var acc6: f32 = 0.0;
   var acc7: f32 = 0.0;
 
-  let numKTiles = (K + TILE_K - 1u) / TILE_K;
+  let blocksPerCol = K >> 8u;
+  let numKTiles = K >> 5u;
+
+  // Cache for block header - 16 pre-computed d*scale values
+  var ds: array<f32, 16>;
+  var blockByteOffset: u32 = 0u;
+  var lastBlkIdx: u32 = 0xFFFFFFFFu;
 
   for (var kt = 0u; kt < numKTiles; kt++) {
-    let kStart = kt * TILE_K;
-    let kEnd = min(kStart + TILE_K, K);
-    let tileLen = kEnd - kStart;
+    let kStart = kt << 5u;
+    let blkIdx = kt >> 3u;       // which Q6_K block (8 K-tiles per block)
+    let quadrant = kt & 7u;      // which quadrant within block (0-7)
 
-    // Step 1: Cooperatively dequantize weights into shared memory
+    // Step 1: Dequantize weights for this K-tile
     if (validCol) {
-      for (var kk = 0u; kk < tileLen; kk++) {
-        sharedW[tid * TILE_K + kk] = dequant_q6k(kStart + kk, col, K);
+      // Refresh block cache when entering new block
+      if (blkIdx != lastBlkIdx) {
+        lastBlkIdx = blkIdx;
+        blockByteOffset = (col * blocksPerCol + blkIdx) * BYTES_PER_BLOCK;
+
+        let d = f16_to_f32(read_u16(blockByteOffset + 208u));
+
+        // Read all 16 scales and pre-multiply with d
+        let sc_0_3 = read_4bytes(blockByteOffset + 192u);
+        let sc_4_7 = read_4bytes(blockByteOffset + 196u);
+        let sc_8_11 = read_4bytes(blockByteOffset + 200u);
+        let sc_12_15 = read_4bytes(blockByteOffset + 204u);
+
+        ds[0] = d * f32(int8_to_i32(sc_0_3 & 0xFFu));
+        ds[1] = d * f32(int8_to_i32((sc_0_3 >> 8u) & 0xFFu));
+        ds[2] = d * f32(int8_to_i32((sc_0_3 >> 16u) & 0xFFu));
+        ds[3] = d * f32(int8_to_i32((sc_0_3 >> 24u) & 0xFFu));
+        ds[4] = d * f32(int8_to_i32(sc_4_7 & 0xFFu));
+        ds[5] = d * f32(int8_to_i32((sc_4_7 >> 8u) & 0xFFu));
+        ds[6] = d * f32(int8_to_i32((sc_4_7 >> 16u) & 0xFFu));
+        ds[7] = d * f32(int8_to_i32((sc_4_7 >> 24u) & 0xFFu));
+        ds[8] = d * f32(int8_to_i32(sc_8_11 & 0xFFu));
+        ds[9] = d * f32(int8_to_i32((sc_8_11 >> 8u) & 0xFFu));
+        ds[10] = d * f32(int8_to_i32((sc_8_11 >> 16u) & 0xFFu));
+        ds[11] = d * f32(int8_to_i32((sc_8_11 >> 24u) & 0xFFu));
+        ds[12] = d * f32(int8_to_i32(sc_12_15 & 0xFFu));
+        ds[13] = d * f32(int8_to_i32((sc_12_15 >> 8u) & 0xFFu));
+        ds[14] = d * f32(int8_to_i32((sc_12_15 >> 16u) & 0xFFu));
+        ds[15] = d * f32(int8_to_i32((sc_12_15 >> 24u) & 0xFFu));
+      }
+
+      // Determine which chunk and quadrant within chunk
+      let chunk = quadrant >> 2u;        // 0 or 1
+      let quadInChunk = quadrant & 3u;   // 0-3
+
+      let qlBase = blockByteOffset + chunk * 64u;
+      let qhBase = blockByteOffset + 128u + chunk * 32u;
+      let wBase = tid * TILE_K;
+
+      // Scale indices for this quadrant
+      // quadInChunk 0 -> scales 0,1; quadInChunk 1 -> scales 2,3; etc.
+      let scBase = chunk * 8u + quadInChunk * 2u;
+      let dsLo = ds[scBase];
+      let dsHi = ds[scBase + 1u];
+
+      // Process 32 elements (8 iterations of 4 elements each)
+      for (var i = 0u; i < 8u; i++) {
+        let l = i * 4u;
+
+        // Read 4 ql bytes, 4 ql+32 bytes, 4 qh bytes
+        let ql_lo = read_4bytes(qlBase + l);
+        let ql_hi = read_4bytes(qlBase + l + 32u);
+        let qh_packed = read_4bytes(qhBase + l);
+
+        // Process 4 l values
+        for (var j = 0u; j < 4u; j++) {
+          let lj = l + j;
+          let shift = j << 3u;
+
+          let ql0 = (ql_lo >> shift) & 0xFFu;
+          let ql32 = (ql_hi >> shift) & 0xFFu;
+          let qh = (qh_packed >> shift) & 0xFFu;
+
+          // Select scale based on l position (l<16 vs l>=16)
+          let dsVal = select(dsLo, dsHi, lj >= 16u);
+
+          var q: i32;
+          if (quadInChunk == 0u) {
+            q = i32((ql0 & 0xFu) | (((qh >> 0u) & 3u) << 4u)) - 32;
+          } else if (quadInChunk == 1u) {
+            q = i32((ql32 & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32;
+          } else if (quadInChunk == 2u) {
+            q = i32((ql0 >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32;
+          } else {
+            q = i32((ql32 >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32;
+          }
+
+          sharedW[wBase + lj] = dsVal * f32(q);
+        }
       }
     } else {
-      for (var kk = 0u; kk < TILE_K; kk++) {
-        sharedW[tid * TILE_K + kk] = 0.0;
+      let wBase = tid * TILE_K;
+      for (var i = 0u; i < TILE_K; i++) {
+        sharedW[wBase + i] = 0.0;
       }
     }
 
-    // Step 2: Cooperatively load X tile
-    let xLoadCount = TILE_M * tileLen;
-    let loadsPerThread = (xLoadCount + 63u) / 64u;
-    for (var i = 0u; i < loadsPerThread; i++) {
-      let flatIdx = tid + i * 64u;
-      if (flatIdx < xLoadCount) {
-        let mLocal = flatIdx / tileLen;
-        let kk = flatIdx % tileLen;
-        let globalRow = rowBase + mLocal;
-        if (globalRow < M) {
-          sharedX[mLocal * TILE_K + kk] = X[globalRow * K + kStart + kk];
-        } else {
-          sharedX[mLocal * TILE_K + kk] = 0.0;
-        }
+    // Step 2: Cooperatively load X tile (8 rows × 32 cols)
+    for (var i = 0u; i < 4u; i++) {
+      let flatIdx = tid * 4u + i;
+      let mLocal = flatIdx >> 5u;
+      let kk = flatIdx & 31u;
+      let globalRow = rowBase + mLocal;
+      if (globalRow < M) {
+        sharedX[flatIdx] = X[globalRow * K + kStart + kk];
+      } else {
+        sharedX[flatIdx] = 0.0;
       }
     }
 
     workgroupBarrier();
 
     // Step 3: Accumulate
-    let wBase = tid * TILE_K;
-    for (var kk = 0u; kk < tileLen; kk++) {
-      let wVal = sharedW[wBase + kk];
-      acc0 += sharedX[0u * TILE_K + kk] * wVal;
-      acc1 += sharedX[1u * TILE_K + kk] * wVal;
-      acc2 += sharedX[2u * TILE_K + kk] * wVal;
-      acc3 += sharedX[3u * TILE_K + kk] * wVal;
-      acc4 += sharedX[4u * TILE_K + kk] * wVal;
-      acc5 += sharedX[5u * TILE_K + kk] * wVal;
-      acc6 += sharedX[6u * TILE_K + kk] * wVal;
-      acc7 += sharedX[7u * TILE_K + kk] * wVal;
+    if (validCol) {
+      let wBase = tid * TILE_K;
+      for (var kk = 0u; kk < TILE_K; kk++) {
+        let wVal = sharedW[wBase + kk];
+        acc0 += sharedX[kk] * wVal;
+        acc1 += sharedX[TILE_K + kk] * wVal;
+        acc2 += sharedX[2u * TILE_K + kk] * wVal;
+        acc3 += sharedX[3u * TILE_K + kk] * wVal;
+        acc4 += sharedX[4u * TILE_K + kk] * wVal;
+        acc5 += sharedX[5u * TILE_K + kk] * wVal;
+        acc6 += sharedX[6u * TILE_K + kk] * wVal;
+        acc7 += sharedX[7u * TILE_K + kk] * wVal;
+      }
     }
 
     workgroupBarrier();

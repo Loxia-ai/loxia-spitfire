@@ -20,18 +20,19 @@ import { GGMLType } from '../../../types/model.js';
 // ============================================================================
 
 const FUSED_QKV_Q4K_SHADER = `
-// Fused QKV Projection for Q4_K quantized weights
+// Optimized Fused QKV Projection for Q4_K quantized weights
 // Reads input x ONCE into shared memory, writes Q, K, V to SEPARATE buffers
 //
-// x: f32 [1, K]
-// Wq, Wk, Wv: Q4_K quantized [K, dim] (separate buffers)
-// outQ, outK, outV: f32 outputs (separate buffers)
+// Key optimizations:
+// 1. Process K in Q4_K blocks (256 elements), read block header ONCE per block
+// 2. Pre-compute d*scale products for all 8 sub-blocks
+// 3. Batch u32 reads for qs values (Q4_K is 4-byte aligned: 144 bytes = 36 u32s)
 
 struct Params {
-  K: u32,           // Input dimension (hidden size)
-  qDim: u32,        // Q output dimension
-  kDim: u32,        // K output dimension
-  vDim: u32,        // V output dimension
+  K: u32,
+  qDim: u32,
+  kDim: u32,
+  vDim: u32,
 }
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
@@ -43,93 +44,108 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> outV: array<f32>;
 @group(0) @binding(7) var<uniform> params: Params;
 
-const BLOCK_SIZE: u32 = 256u;
-const BYTES_PER_BLOCK: u32 = 144u;
 const WG_SIZE: u32 = 256u;
 
 var<workgroup> sharedX: array<f32, 4096>;
 
-fn f16_to_f32(bits: u32) -> f32 {
-  let sign = (bits >> 15u) & 1u;
-  let exp = (bits >> 10u) & 0x1Fu;
-  let mant = bits & 0x3FFu;
+fn unpack_f16(packed: u32) -> f32 {
+  let sign = (packed >> 15u) & 1u;
+  let exp = (packed >> 10u) & 0x1Fu;
+  let mant = packed & 0x3FFu;
   if (exp == 0u) {
     if (mant == 0u) { return select(0.0, -0.0, sign == 1u); }
-    let f = f32(mant) / 1024.0 * pow(2.0, -14.0);
-    return select(f, -f, sign == 1u);
+    return select(1.0, -1.0, sign == 1u) * f32(mant) * 5.960464478e-8;
   } else if (exp == 31u) {
-    return select(1.0e38, -1.0e38, sign == 1u);
+    return select(1.0, -1.0, sign == 1u) * 65504.0;
   }
-  let f = (1.0 + f32(mant) / 1024.0) * pow(2.0, f32(exp) - 15.0);
-  return select(f, -f, sign == 1u);
+  let e = i32(exp) - 15;
+  let m = 1.0 + f32(mant) / 1024.0;
+  return select(1.0, -1.0, sign == 1u) * m * pow(2.0, f32(e));
 }
 
-fn read_byte_q(W: ptr<storage, array<u32>, read>, byteOffset: u32) -> u32 {
-  let u32Idx = byteOffset >> 2u;
-  let byteInU32 = byteOffset & 3u;
-  return ((*W)[u32Idx] >> (byteInU32 << 3u)) & 0xFFu;
-}
+// Block-optimized GEMV: process one Q4_K block (256 elements) at a time
+fn compute_gemv_q4k_opt(W: ptr<storage, array<u32>, read>, col: u32, K: u32) -> f32 {
+  var acc: f32 = 0.0;
+  let blocksPerCol = K >> 8u;
 
-fn read_u16_q(W: ptr<storage, array<u32>, read>, byteOffset: u32) -> u32 {
-  let u32Idx = byteOffset >> 2u;
-  let byteInU32 = byteOffset & 3u;
-  let data = (*W)[u32Idx];
-  if (byteInU32 < 3u) {
-    return (data >> (byteInU32 << 3u)) & 0xFFFFu;
-  } else {
-    let lo = (data >> 24u) & 0xFFu;
-    let hi = (*W)[u32Idx + 1u] & 0xFFu;
-    return lo | (hi << 8u);
+  for (var blk = 0u; blk < blocksPerCol; blk++) {
+    let blockIdx = col * blocksPerCol + blk;
+    let blockU32Idx = blockIdx * 36u;  // 144 bytes = 36 u32s per Q4_K block
+    let kBase = blk << 8u;
+
+    // Read d and dmin in ONE u32 read
+    let dPacked = (*W)[blockU32Idx];
+    let d = unpack_f16(dPacked & 0xFFFFu);
+    let dmin = unpack_f16(dPacked >> 16u);
+
+    // Read all 12 scale bytes as 3 u32s
+    let sc0 = (*W)[blockU32Idx + 1u];
+    let sc1 = (*W)[blockU32Idx + 2u];
+    let sc2 = (*W)[blockU32Idx + 3u];
+
+    // Extract and pre-compute d*scale, dmin*min for all 8 sub-blocks
+    let ds0 = d * f32(sc0 & 0x3Fu);
+    let ds1 = d * f32((sc0 >> 8u) & 0x3Fu);
+    let ds2 = d * f32((sc0 >> 16u) & 0x3Fu);
+    let ds3 = d * f32((sc0 >> 24u) & 0x3Fu);
+    let dm0 = dmin * f32(sc1 & 0x3Fu);
+    let dm1 = dmin * f32((sc1 >> 8u) & 0x3Fu);
+    let dm2 = dmin * f32((sc1 >> 16u) & 0x3Fu);
+    let dm3 = dmin * f32((sc1 >> 24u) & 0x3Fu);
+
+    let ds4 = d * f32((sc2 & 0x0Fu) | ((sc0 >> 2u) & 0x30u));
+    let ds5 = d * f32(((sc2 >> 8u) & 0x0Fu) | ((sc0 >> 10u) & 0x30u));
+    let ds6 = d * f32(((sc2 >> 16u) & 0x0Fu) | ((sc0 >> 18u) & 0x30u));
+    let ds7 = d * f32(((sc2 >> 24u) & 0x0Fu) | ((sc0 >> 26u) & 0x30u));
+    let dm4 = dmin * f32(((sc2 >> 4u) & 0x0Fu) | ((sc1 >> 2u) & 0x30u));
+    let dm5 = dmin * f32(((sc2 >> 12u) & 0x0Fu) | ((sc1 >> 10u) & 0x30u));
+    let dm6 = dmin * f32(((sc2 >> 20u) & 0x0Fu) | ((sc1 >> 18u) & 0x30u));
+    let dm7 = dmin * f32(((sc2 >> 28u) & 0x0Fu) | ((sc1 >> 26u) & 0x30u));
+
+    // qs array starts at u32 offset 4
+    let qsU32Base = blockU32Idx + 4u;
+
+    // Process 4 pairs of sub-blocks (0&1, 2&3, 4&5, 6&7)
+    for (var pair = 0u; pair < 4u; pair++) {
+      let kOff = kBase + pair * 64u;
+
+      // Select pre-computed scales for this pair
+      var dsE: f32; var dmE: f32; var dsO: f32; var dmO: f32;
+      if (pair == 0u) { dsE = ds0; dmE = dm0; dsO = ds1; dmO = dm1; }
+      else if (pair == 1u) { dsE = ds2; dmE = dm2; dsO = ds3; dmO = dm3; }
+      else if (pair == 2u) { dsE = ds4; dmE = dm4; dsO = ds5; dmO = dm5; }
+      else { dsE = ds6; dmE = dm6; dsO = ds7; dmO = dm7; }
+
+      // Read 8 u32s (32 bytes) for this sub-block pair
+      let qsBase = qsU32Base + pair * 8u;
+
+      for (var w = 0u; w < 8u; w++) {
+        let packed = (*W)[qsBase + w];
+
+        // Extract 8 4-bit values from this u32
+        let q0 = packed & 0xFu;
+        let q1 = (packed >> 4u) & 0xFu;
+        let q2 = (packed >> 8u) & 0xFu;
+        let q3 = (packed >> 12u) & 0xFu;
+        let q4 = (packed >> 16u) & 0xFu;
+        let q5 = (packed >> 20u) & 0xFu;
+        let q6 = (packed >> 24u) & 0xFu;
+        let q7 = (packed >> 28u) & 0xFu;
+
+        // Low nibbles go to even sub-block, high nibbles to odd
+        let idx = kOff + w * 4u;
+        acc += sharedX[idx] * (dsE * f32(q0) - dmE);
+        acc += sharedX[idx + 1u] * (dsE * f32(q2) - dmE);
+        acc += sharedX[idx + 2u] * (dsE * f32(q4) - dmE);
+        acc += sharedX[idx + 3u] * (dsE * f32(q6) - dmE);
+        acc += sharedX[idx + 32u] * (dsO * f32(q1) - dmO);
+        acc += sharedX[idx + 33u] * (dsO * f32(q3) - dmO);
+        acc += sharedX[idx + 34u] * (dsO * f32(q5) - dmO);
+        acc += sharedX[idx + 35u] * (dsO * f32(q7) - dmO);
+      }
+    }
   }
-}
-
-// Dequantize a single weight element using correct memory layout
-// Memory layout: linearIdx = col * K + k, blocks are column-by-column
-fn dequant_weight_q4k(W: ptr<storage, array<u32>, read>, k: u32, col: u32, K: u32) -> f32 {
-  let linearIdx = col * K + k;
-  let blockIdx = linearIdx >> 8u;           // / 256
-  let posInBlock = linearIdx & 255u;        // % 256
-  let blockByteOffset = blockIdx * BYTES_PER_BLOCK;
-
-  // Read d and dmin from block header
-  let dBits = read_u16_q(W, blockByteOffset);
-  let dminBits = read_u16_q(W, blockByteOffset + 2u);
-  let d = f16_to_f32(dBits);
-  let dmin = f16_to_f32(dminBits);
-
-  // Determine sub-block (0..7) and position
-  let subBlock = posInBlock >> 5u;          // / 32
-  let posInSubBlock = posInBlock & 31u;     // % 32
-
-  // Get scale and min for this sub-block
-  let scalesOffset = blockByteOffset + 4u;
-  var sc: u32;
-  var mn: u32;
-
-  if (subBlock < 4u) {
-    sc = read_byte_q(W, scalesOffset + subBlock) & 0x3Fu;
-    mn = read_byte_q(W, scalesOffset + subBlock + 4u) & 0x3Fu;
-  } else {
-    let jm4 = subBlock - 4u;
-    sc = (read_byte_q(W, scalesOffset + subBlock + 4u) & 0x0Fu) | ((read_byte_q(W, scalesOffset + jm4) >> 6u) << 4u);
-    mn = (read_byte_q(W, scalesOffset + subBlock + 4u) >> 4u) | ((read_byte_q(W, scalesOffset + subBlock) >> 6u) << 4u);
-  }
-
-  // Read 4-bit quantized value
-  let qsOffset = blockByteOffset + 16u;
-  let byteIndex = ((subBlock >> 1u) << 5u) + posInSubBlock;  // (subBlock/2)*32 + pos
-  let qByte = read_byte_q(W, qsOffset + byteIndex);
-  let q = select(qByte & 0x0Fu, qByte >> 4u, (subBlock & 1u) != 0u);
-
-  return d * f32(sc) * f32(q) - dmin * f32(mn);
-}
-
-fn compute_gemv_q4k(W: ptr<storage, array<u32>, read>, col: u32, outDim: u32, K: u32) -> f32 {
-  var sum: f32 = 0.0;
-  for (var k = 0u; k < K; k++) {
-    sum += sharedX[k] * dequant_weight_q4k(W, k, col, K);
-  }
-  return sum;
+  return acc;
 }
 
 @compute @workgroup_size(256)
@@ -158,11 +174,11 @@ fn main(
   if (outIdx >= totalOut) { return; }
 
   if (outIdx < qDim) {
-    outQ[outIdx] = compute_gemv_q4k(&Wq, outIdx, qDim, K);
+    outQ[outIdx] = compute_gemv_q4k_opt(&Wq, outIdx, K);
   } else if (outIdx < qDim + kDim) {
-    outK[outIdx - qDim] = compute_gemv_q4k(&Wk, outIdx - qDim, kDim, K);
+    outK[outIdx - qDim] = compute_gemv_q4k_opt(&Wk, outIdx - qDim, K);
   } else {
-    outV[outIdx - qDim - kDim] = compute_gemv_q4k(&Wv, outIdx - qDim - kDim, vDim, K);
+    outV[outIdx - qDim - kDim] = compute_gemv_q4k_opt(&Wv, outIdx - qDim - kDim, K);
   }
 }
 `;
