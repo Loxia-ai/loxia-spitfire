@@ -14,6 +14,7 @@ import {
   rmsNorm,
   addRmsNorm,
   applyRope,
+  fusedRopeAndKVCache,
   feedForwardQ,
   matmulQ,
   loadLlamaWeights,
@@ -22,6 +23,7 @@ import {
   getCommandBatcherStats,
   resetCommandBatcherStats,
   resetMatmulQDebugCount,
+  resetAllPipelines,
   QuantizedTensor,
   type LlamaWeights,
   type LlamaLayerWeights,
@@ -217,12 +219,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         this.chatTemplate = ggufTemplate;
         debugLog('Chat template loaded from GGUF metadata (Jinja2 format)');
       } else if (arch === 'qwen2' || arch === 'qwen') {
-        // Fallback Qwen2 template if not in GGUF
-        this.chatTemplate = '{% for message in messages %}{% if message.role == "user" %}<|im_start|>user\n{{ message.content }}<|im_end|>\n<|im_start|>assistant\n{% endif %}{% endfor %}';
-        debugLog('Using fallback Qwen2 chat template');
+        // Fallback Qwen2/Qwen3 template if not in GGUF
+        // Format: <|im_start|>role\ncontent<|im_end|>\n
+        this.chatTemplate = `{% for message in messages %}<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
+{% endif %}`;
+        debugLog('Using fallback Qwen chat template');
       } else if (arch === 'llama' || arch === 'llama2') {
         // Fallback Llama 2 template
-        this.chatTemplate = '{% for message in messages %}{% if message.role == "user" %}[INST] {{ message.content }} [/INST]{% endif %}{% endfor %}';
+        this.chatTemplate = '{% for message in messages %}{% if message.role == "system" %}<<SYS>>\n{{ message.content }}\n<</SYS>>\n\n{% elif message.role == "user" %}[INST] {{ message.content }} [/INST]{% elif message.role == "assistant" %}{{ message.content }}{% endif %}{% endfor %}';
         debugLog('Using fallback Llama2 chat template');
       } else {
         this.chatTemplate = null;
@@ -514,13 +520,12 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       isIncremental = true;
       startPos = this.kvCache.seqLen;
       tokensToProcess = inputIds.slice(startPos);
-      // Reduce logging noise - only log for multi-token incremental (speculation)
-      if (tokensToProcess.length > 1) {
-        debugLog(`[Forward] INCREMENTAL: processing ${tokensToProcess.length} token(s) at pos ${startPos}`);
-      }
+      // Debug: always log for diagnosis
+      console.log(`[Forward] INCREMENTAL: seqLen=${this.kvCache.seqLen}, inputIds.length=${inputIds.length}, tokensToProcess.length=${tokensToProcess.length}`);
     } else {
       // Full mode: process all tokens (prefill)
       tokensToProcess = inputIds;
+      console.log(`[Forward] PREFILL: kvCache=${!!this.kvCache}, seqLen=${this.kvCache?.seqLen ?? 'N/A'}, inputIds.length=${inputIds.length}`);
 
       // Initialize or reset GPU cache if using cache
       if (useCache) {
@@ -765,6 +770,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   private forwardTensorCount = 0;
 
   private async forwardTensor(inputIds: number[], useCache = false): Promise<Tensor> {
+
     if (!this.weights) {
       throw new Error('Model weights not loaded');
     }
@@ -1073,6 +1079,169 @@ export class WebGPUEngine extends EventEmitter implements Engine {
   }
 
   /**
+   * Early-exit forward pass for draft token generation
+   * Runs only the first N layers (no KV cache) for fast speculation
+   *
+   * @param inputIds - Token IDs to process
+   * @param numLayers - Number of layers to run (default: 6)
+   * @returns Logits for sampling draft token
+   */
+  private async forwardDraft(
+    inputIds: number[],
+    numLayers: number = 6
+  ): Promise<Float32Array> {
+    if (!this.weights) {
+      throw new Error('Model weights not loaded');
+    }
+
+    const processLen = inputIds.length;
+
+    // Embedding lookup
+    let hidden = await ops.embeddingLookup(
+      this.weights.tokenEmbedding!,
+      inputIds,
+      this.vocabSize
+    );
+
+    // Initial norm for first layer
+    let normed: Tensor | null = null;
+    {
+      const firstLayer = this.weights.layers[0];
+      if (firstLayer?.attnNorm) {
+        normed = await rmsNorm(hidden, firstLayer.attnNorm, this.rmsNormEps);
+      }
+    }
+
+    // Process only first N layers (NO KV cache - standalone draft)
+    const layersToRun = Math.min(numLayers, this.weights.layers.length);
+
+    for (let layerIdx = 0; layerIdx < layersToRun; layerIdx++) {
+      const layer = this.weights.layers[layerIdx];
+
+      if (!layer.attnNorm || !layer.ffnNorm) {
+        continue;
+      }
+
+      const normed1 = normed!;
+
+      // Self-attention WITHOUT KV cache (draft mode)
+      // Use simple attention computation for speed
+      const attnOut = await this.selfAttentionNoCacheForDraft(
+        normed1,
+        layer,
+        processLen
+      );
+
+      // Fused residual add + pre-FFN norm
+      const { sum: afterAttn, normed: normed2 } = await addRmsNorm(
+        hidden, attnOut, layer.ffnNorm!, this.rmsNormEps
+      );
+      hidden.destroy();
+      if (attnOut !== normed1) {
+        normed1.destroy();
+        attnOut.destroy();
+      }
+      hidden = afterAttn;
+
+      // Feed-forward
+      if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
+        const ffnOut = await feedForwardQ(
+          normed2,
+          layer.ffnGate,
+          layer.ffnUp,
+          layer.ffnDown
+        );
+
+        // Fuse post-FFN add + next layer's pre-attention norm
+        const nextLayer = layerIdx + 1 < layersToRun ? this.weights.layers[layerIdx + 1] : null;
+        if (nextLayer?.attnNorm) {
+          const fused = await addRmsNorm(hidden, ffnOut, nextLayer.attnNorm, this.rmsNormEps);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = fused.sum;
+          normed = fused.normed;
+        } else {
+          const afterFFN = await ops.add(hidden, ffnOut);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = afterFFN;
+          normed = null;
+        }
+        normed2.destroy();
+      } else {
+        normed2.destroy();
+        normed = null;
+      }
+    }
+
+    // Final norm (using the main output norm)
+    const normWeight = this.weights.outputNorm || Tensor.ones([this.hiddenSize]);
+    const finalNormed = await rmsNorm(hidden, normWeight, this.rmsNormEps);
+    hidden.destroy();
+    if (!this.weights.outputNorm) {
+      normWeight.destroy();
+    }
+
+    // Extract last token's hidden state
+    const lastTokenHidden = await ops.sliceLastRow(finalNormed);
+    finalNormed.destroy();
+
+    // Output projection (LM head)
+    let logits: Tensor;
+    if (this.weights.outputWeight) {
+      logits = await matmulQ(lastTokenHidden, this.weights.outputWeight);
+    } else {
+      logits = Tensor.random([1, this.vocabSize], { label: 'draft_logits' });
+    }
+    lastTokenHidden.destroy();
+
+    // Transfer to CPU
+    const logitsData = await logits.toArray();
+    logits.destroy();
+
+    return logitsData;
+  }
+
+  /**
+   * Simplified self-attention for draft mode (no KV cache)
+   * This is a streamlined version that computes attention from scratch
+   */
+  private async selfAttentionNoCacheForDraft(
+    x: Tensor,
+    layer: LlamaLayerWeights,
+    seqLen: number
+  ): Promise<Tensor> {
+    // Project to Q, K, V
+    const q = await matmulQ(x, layer.attnQ!);
+    const k = await matmulQ(x, layer.attnK!);
+    const v = await matmulQ(x, layer.attnV!);
+
+    // Apply RoPE (startPos = 0 for draft, full sequence)
+    const qRoped = await applyRope(q, seqLen, this.numHeads, this.headDim, this.ropeBase, 0);
+    const kRoped = await applyRope(k, seqLen, this.numKVHeads, this.headDim, this.ropeBase, 0);
+    q.destroy();
+    k.destroy();
+
+    // Causal attention (full, no cache)
+    const attnResult = await ops.causalAttention(
+      qRoped, kRoped, v,
+      this.numHeads,
+      this.numKVHeads,
+      this.headDim,
+      seqLen  // Full sequence length
+    );
+    qRoped.destroy();
+    kRoped.destroy();
+    v.destroy();
+
+    // Output projection
+    const output = await matmulQ(attnResult, layer.attnOutput!);
+    attnResult.destroy();
+
+    return output;
+  }
+
+  /**
    * Self-attention with Q, K, V projections and GPU-resident KV cache
    * Supports Grouped Query Attention (GQA) where numKVHeads < numHeads
    * Uses GPU KV cache for O(n) per-token generation instead of O(n²)
@@ -1188,58 +1357,55 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       qBeforeRope = Array.from(qArr.slice(0, 8)); // First 8 values of pos 0
     }
 
-    // Apply RoPE to Q and K
-    // IMPORTANT: RoPE needs absolute positions, not relative to batch
-    // For incremental: Q positions are [startPos, startPos+1, ...], K same
-    const qRope = await applyRope(q, processLen, this.numHeads, this.headDim, this.ropeBase, startPos);
-    const kRope = await applyRope(k, processLen, this.numKVHeads, this.headDim, this.ropeBase, startPos);
-    q.destroy();
-    k.destroy();
-    if (shouldTime) { attnTimings['rope'] = performance.now() - t0; t0 = performance.now(); }
+    // Determine K/V to use for attention
+    let kForAttention: Tensor;
+    let vForAttention: Tensor;
+    let totalSeqLen: number;
+    let qRope: Tensor;
+
+    if (useCache && this.kvCache) {
+      // FUSED PATH: RoPE + KV Cache Write in ONE kernel
+      // Saves 4 kernel calls (2 rope + 2 copy_rows)
+      qRope = await fusedRopeAndKVCache(
+        q, k, vProj,
+        this.kvCache.keys[layerIdx],
+        this.kvCache.values[layerIdx],
+        this.numHeads,
+        this.numKVHeads,
+        this.headDim,
+        startPos,
+        this.ropeBase
+      );
+      q.destroy();
+      k.destroy();
+      vProj.destroy();
+      if (shouldTime) { attnTimings['fusedRopeKV'] = performance.now() - t0; t0 = performance.now(); }
+
+      totalSeqLen = startPos + processLen;
+      kForAttention = this.kvCache.keys[layerIdx];
+      vForAttention = this.kvCache.values[layerIdx];
+    } else {
+      // No cache mode: apply RoPE separately
+      qRope = await applyRope(q, processLen, this.numHeads, this.headDim, this.ropeBase, startPos);
+      const kRope = await applyRope(k, processLen, this.numKVHeads, this.headDim, this.ropeBase, startPos);
+      q.destroy();
+      k.destroy();
+      if (shouldTime) { attnTimings['rope'] = performance.now() - t0; t0 = performance.now(); }
+
+      kForAttention = kRope;
+      vForAttention = vProj;
+      totalSeqLen = processLen;
+    }
 
     // Debug: check Q after RoPE
     if (debugRope && qBeforeRope) {
       const qData = await qRope.toArray();
-      const kData = await kRope.toArray();
       this.debugStats(qData, 'Q post-RoPE');
-      this.debugStats(kData, 'K post-RoPE');
       const qAfterRope = Array.from(qData.slice(0, 8));
       const qLastPosAfter = Array.from(qData.slice(-this.numHeads * this.headDim, -this.numHeads * this.headDim + 8));
       debugLog(`[RoPE] Q pos0 before: [${qBeforeRope.map(v => v.toFixed(4)).join(', ')}]`);
       debugLog(`[RoPE] Q pos0 after:  [${qAfterRope.map(v => v.toFixed(4)).join(', ')}]`);
       debugLog(`[RoPE] Q pos${processLen - 1} after: [${qLastPosAfter.map(v => v.toFixed(4)).join(', ')}]`);
-    }
-
-    // Determine K/V to use for attention
-    let kForAttention: Tensor;
-    let vForAttention: Tensor;
-    let totalSeqLen: number;
-
-    if (useCache && this.kvCache) {
-      // GPU KV Cache mode: copy new K/V to cache, use full cached K/V for attention
-
-      // Copy new K/V to cache at position startPos (stays on GPU)
-      await ops.copyRows(kRope, this.kvCache.keys[layerIdx], startPos);
-      await ops.copyRows(vProj, this.kvCache.values[layerIdx], startPos);
-      if (shouldTime) { attnTimings['copyRows'] = performance.now() - t0; t0 = performance.now(); }
-
-      // Total sequence length after adding new tokens
-      totalSeqLen = startPos + processLen;
-
-      // Create views into the cache for the valid portion
-      // We need to slice the cache to only include positions 0 to totalSeqLen
-      // For efficiency, we pass the full cache but tell attention the actual key count
-      kForAttention = this.kvCache.keys[layerIdx];
-      vForAttention = this.kvCache.values[layerIdx];
-
-      // Clean up the newly projected K/V (they're now copied to cache)
-      kRope.destroy();
-      vProj.destroy();
-    } else {
-      // No cache mode: use newly computed K/V directly
-      kForAttention = kRope;
-      vForAttention = vProj;
-      totalSeqLen = processLen;
     }
 
     // GPU-accelerated causal attention
@@ -1274,7 +1440,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     attnOut.destroy();
     if (shouldTime) {
       attnTimings['outProj'] = performance.now() - t0;
-      debugLog(`[AttnL0] qkvProj=${attnTimings['qkvProj']?.toFixed(1)}ms biases=${attnTimings['biases']?.toFixed(1)}ms rope=${attnTimings['rope']?.toFixed(1)}ms copyRows=${attnTimings['copyRows']?.toFixed(1)}ms causalAttn=${attnTimings['causalAttn']?.toFixed(1)}ms outProj=${attnTimings['outProj']?.toFixed(1)}ms`);
+      debugLog(`[AttnL0] qkvProj=${attnTimings['qkvProj']?.toFixed(1)}ms biases=${attnTimings['biases']?.toFixed(1)}ms fusedRopeKV=${attnTimings['fusedRopeKV']?.toFixed(1) || attnTimings['rope']?.toFixed(1)}ms causalAttn=${attnTimings['causalAttn']?.toFixed(1)}ms outProj=${attnTimings['outProj']?.toFixed(1)}ms`);
     }
 
     return projected;
@@ -1463,34 +1629,31 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     let tokenCount = 0;
     let forwardPasses = 0;  // Track forward passes for efficiency metrics
+    let draftPasses = 0;    // Track early-exit draft passes
+    let earlyExitAccepted = 0;  // Track accepted tokens from early-exit
+    let earlyExitProposed = 0;  // Track proposed tokens from early-exit
     const genStartTime = performance.now();
 
+    // Early-exit speculation config
+    const DRAFT_LAYERS = 6;       // Use first 6 layers for drafting
+    const DRAFT_TOKENS = 4;       // Generate 4 draft tokens
+    const USE_EARLY_EXIT = false;  // Disabled: early-exit needs KV cache support to be fast
+
     while (tokenCount < maxTokens) {
-      // Try speculative decoding if enabled and we have enough context
+      // Try N-gram speculation first if enabled
       if (ngramCache && generatedTokens.length >= 2) {
         const allTokens = [...inputIds, ...generatedTokens];
         const draftTokens = ngramCache.getDrafts(allTokens, specConfig.maxDraftTokens);
 
         if (draftTokens.length > 0) {
-          // Speculative path: verify draft tokens in parallel
+          // N-gram speculative path (existing code)
           const cacheSeqLenBefore = this.kvCache?.seqLen ?? 0;
-
-          // Process all draft tokens and get logits for each position
           const fullSequence = [...allTokens, ...draftTokens];
           const allLogits = await this.forwardMultiLogits(fullSequence, draftTokens.length, true);
           forwardPasses++;
 
-          // Verify each draft token
-          // draftTokens[i] should match the prediction from logits[i-1] (or previous position)
-          // For simplicity, we verify draftTokens[i] against logits[i] (output after processing it)
-          // This checks if the continuation is consistent
           let accepted = 0;
-
           for (let i = 0; i < draftTokens.length; i++) {
-            // logits[i] is the output after processing draftTokens[i]
-            // It predicts what should come AFTER draftTokens[i]
-            // To verify draftTokens[i], we'd need logits from the previous position
-            // For now, we use a simplified check: verify draftTokens[i+1] against logits[i]
             if (i < draftTokens.length - 1) {
               const predictedNext = this.sampleToken(allLogits[i], temperature, topK);
               if (draftTokens[i + 1] === predictedNext) {
@@ -1499,13 +1662,94 @@ export class WebGPUEngine extends EventEmitter implements Engine {
                 break;
               }
             } else {
-              // Last draft - always "accept" it, we'll sample next from its logits
               accepted++;
             }
           }
 
-          // Rollback cache to accepted length
-          // We processed `draftTokens.length` tokens, but only keep `accepted`
+          const newCacheLen = cacheSeqLenBefore + accepted;
+          this.rollbackKVCache(newCacheLen);
+
+          let shouldStop = false;
+          for (let i = 0; i < accepted && !shouldStop; i++) {
+            shouldStop = appendToken(draftTokens[i]);
+            tokenCount++;
+          }
+
+          ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+          ngramCache.recordAccepted(accepted);
+
+          if (shouldStop || tokenCount >= maxTokens) break;
+
+          if (accepted > 0 && !shouldStop && tokenCount < maxTokens) {
+            const bonusLogits = allLogits[accepted - 1];
+            const bonusToken = this.sampleToken(bonusLogits, temperature, topK);
+            const currentTokens = [...inputIds, ...generatedTokens];
+            await this.forward([...currentTokens, bonusToken], true);
+            forwardPasses++;
+            shouldStop = appendToken(bonusToken);
+            tokenCount++;
+            ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+            if (shouldStop) break;
+          }
+          continue;
+        }
+      }
+
+      // Early-exit speculation: use first N layers to generate draft tokens
+      if (USE_EARLY_EXIT && generatedTokens.length >= 1) {
+        const allTokens = [...inputIds, ...generatedTokens];
+        const cacheSeqLenBefore = this.kvCache?.seqLen ?? 0;
+
+        // Generate draft tokens using early-exit (first 6 layers only)
+        const draftTokens: number[] = [];
+        let currentDraftSequence = [...allTokens];
+
+        for (let d = 0; d < DRAFT_TOKENS; d++) {
+          const draftLogits = await this.forwardDraft(currentDraftSequence, DRAFT_LAYERS);
+          draftPasses++;
+
+          const draftToken = this.sampleToken(draftLogits, temperature, topK);
+          draftTokens.push(draftToken);
+          currentDraftSequence.push(draftToken);
+
+          // Stop drafting on EOS
+          if (draftToken === eosId) break;
+        }
+
+        if (draftTokens.length > 0) {
+          earlyExitProposed += draftTokens.length;
+
+          // Verify all draft tokens with full model in ONE pass
+          const fullSequence = [...allTokens, ...draftTokens];
+          const allLogits = await this.forwardMultiLogits(fullSequence, draftTokens.length, true);
+          forwardPasses++;
+
+          // Verify: check if full model agrees with each draft
+          // We need to check: given logits[i-1], would we sample draftTokens[i]?
+          // But logits[0] is output AFTER draftTokens[0], predicting what comes next
+          // So logits[i] predicts draftTokens[i+1]
+          let accepted = 0;
+
+          for (let i = 0; i < draftTokens.length; i++) {
+            if (i < draftTokens.length - 1) {
+              // Check if logits[i] would produce draftTokens[i+1]
+              const predictedNext = this.sampleToken(allLogits[i], temperature, topK);
+              if (draftTokens[i + 1] === predictedNext) {
+                accepted++;
+              } else {
+                // Mismatch - accept up to here, plus the correct next token
+                accepted++;  // Accept current draft token
+                break;
+              }
+            } else {
+              // Last draft token - always accept
+              accepted++;
+            }
+          }
+
+          earlyExitAccepted += accepted;
+
+          // Rollback KV cache to keep only accepted tokens
           const newCacheLen = cacheSeqLenBefore + accepted;
           this.rollbackKVCache(newCacheLen);
 
@@ -1516,49 +1760,42 @@ export class WebGPUEngine extends EventEmitter implements Engine {
             tokenCount++;
           }
 
-          // Update n-gram cache with accepted tokens
-          ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
-          ngramCache.recordAccepted(accepted);
+          if (shouldStop || tokenCount >= maxTokens) break;
 
-          if (shouldStop || tokenCount >= maxTokens) {
-            break;
-          }
-
-          // Sample bonus token from last accepted position's logits
-          // No additional forward pass needed - we already have the logits!
+          // Sample bonus token from last accepted position
           if (accepted > 0 && !shouldStop && tokenCount < maxTokens) {
             const bonusLogits = allLogits[accepted - 1];
             const bonusToken = this.sampleToken(bonusLogits, temperature, topK);
 
-            // Process ONLY the bonus token incrementally (single token, uses cache)
-            // This is O(1) layers work, not O(n) sequence length
+            // Update KV cache with the bonus token
             const currentTokens = [...inputIds, ...generatedTokens];
             await this.forward([...currentTokens, bonusToken], true);
             forwardPasses++;
 
             shouldStop = appendToken(bonusToken);
             tokenCount++;
-            ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
-
             if (shouldStop) break;
           }
 
-          continue; // Next iteration
+          // Update n-gram cache for future use
+          if (ngramCache) {
+            ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
+          }
+
+          continue;
         }
       }
 
-      // Fallback: single token generation (no draft match or speculation disabled)
-      // Use GPU-accelerated sampling to avoid expensive toArray() transfer
+      // Fallback: single token generation (no speculation)
       const allIds = [...inputIds, ...generatedTokens];
       const logitsTensor = await this.forwardTensor(allIds, true);
       forwardPasses++;
 
       const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
-      logitsTensor.destroy();  // Must destroy after GPU sampling
+      logitsTensor.destroy();
       const shouldStop = appendToken(nextToken);
       tokenCount++;
 
-      // Update n-gram cache
       if (ngramCache) {
         ngramCache.update([...inputIds, ...generatedTokens], inputIds.length);
       }
@@ -1576,12 +1813,18 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     const tokensPerForward = generatedTokens.length / Math.max(1, forwardPasses);
 
     debugLog(`[Generate] ${generatedTokens.length} tokens in ${genTimeSeconds.toFixed(2)}s = ${tokensPerSecond.toFixed(1)} tok/s`);
-    debugLog(`[Generate] ${forwardPasses} forward passes, ${tokensPerForward.toFixed(2)} tokens/forward (1.0 = no speculation benefit)`);
+    debugLog(`[Generate] ${forwardPasses} full passes, ${draftPasses} draft passes, ${tokensPerForward.toFixed(2)} tokens/forward`);
 
-    // Log speculative decoding statistics
+    // Log early-exit speculation statistics
+    if (earlyExitProposed > 0) {
+      const acceptRate = ((earlyExitAccepted / earlyExitProposed) * 100).toFixed(1);
+      debugLog(`[EarlyExit] ${earlyExitAccepted}/${earlyExitProposed} accepted (${acceptRate}%), ${DRAFT_LAYERS} layers, ${DRAFT_TOKENS} drafts/iter`);
+    }
+
+    // Log N-gram speculative decoding statistics
     if (ngramCache) {
       const stats = ngramCache.getStats();
-      debugLog(`[Speculative] hitRate=${(stats.hitRate * 100).toFixed(1)}%, acceptRate=${(stats.acceptanceRate * 100).toFixed(1)}%, accepted=${stats.acceptedTokens}/${stats.proposedTokens}`);
+      debugLog(`[Ngram] hitRate=${(stats.hitRate * 100).toFixed(1)}%, acceptRate=${(stats.acceptanceRate * 100).toFixed(1)}%, accepted=${stats.acceptedTokens}/${stats.proposedTokens}`);
     }
 
     // Log command batcher statistics
@@ -1949,10 +2192,11 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       cachedTokens = 0; // Must prefill everything
     }
 
-    // Prefill if needed
+    // Prefill if needed - capture logits for first token generation
+    let prefillLogits: Tensor | null = null;
     if (fullTokenIds.length > (this.kvCache?.seqLen ?? 0)) {
       const prefillStart = performance.now();
-      await this.forwardTensor(fullTokenIds, true);
+      prefillLogits = await this.forwardTensor(fullTokenIds, true);
       const prefillTime = performance.now() - prefillStart;
       debugLog(`[ChatCompletion] Prefill took ${prefillTime.toFixed(1)}ms`);
     }
@@ -1970,11 +2214,21 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     while (generatedTokens.length < maxTokens) {
       const tTok = performance.now();
-      const allIds = [...fullTokenIds, ...generatedTokens];
+      let logitsTensor: Tensor;
+      let fwdTime: number;
 
-      const tFwd = performance.now();
-      const logitsTensor = await this.forwardTensor(allIds, true);
-      const fwdTime = performance.now() - tFwd;
+      if (prefillLogits) {
+        // Use logits from prefill for first token
+        logitsTensor = prefillLogits;
+        prefillLogits = null;
+        fwdTime = 0;
+      } else {
+        // Incremental decode for subsequent tokens
+        const allIds = [...fullTokenIds, ...generatedTokens];
+        const tFwd = performance.now();
+        logitsTensor = await this.forwardTensor(allIds, true);
+        fwdTime = performance.now() - tFwd;
+      }
 
       const tSamp = performance.now();
       const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
@@ -2027,6 +2281,179 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       cachedTokens,
       totalTokens: fullTokenIds.length + generatedTokens.length,
     };
+  }
+
+  /**
+   * Streaming chat completion with KV cache persistence
+   * Yields tokens as they're generated, caches conversation for fast follow-ups
+   *
+   * @example
+   * ```typescript
+   * for await (const token of engine.chatCompletionStream({
+   *   messages: [
+   *     { role: 'system', content: 'You are helpful' },
+   *     { role: 'user', content: 'Hello!' }
+   *   ],
+   *   maxTokens: 256
+   * })) {
+   *   process.stdout.write(token);
+   * }
+   * ```
+   */
+  async *chatCompletionStream(options: {
+    messages: ChatMessage[];
+    maxTokens?: number;
+    temperature?: number;
+    topK?: number;
+    stop?: string[];
+  }): AsyncGenerator<string, void, unknown> {
+    if (!this.modelLoaded) {
+      throw new Error('Model not loaded');
+    }
+
+    const {
+      messages,
+      maxTokens = 256,
+      temperature = 0.8,
+      topK = 40,
+      stop = [],
+    } = options;
+
+    if (!messages || messages.length === 0) {
+      throw new Error('Messages array cannot be empty');
+    }
+
+    // Format conversation with chat template
+    const fullPrompt = this.applyChatTemplateForMessages(messages, true);
+
+    // Tokenize full conversation
+    let fullTokenIds: number[];
+    if (this.tokenizer) {
+      fullTokenIds = this.tokenizer.encode(fullPrompt);
+    } else {
+      fullTokenIds = Array.from(fullPrompt).map(c => c.charCodeAt(0) % this.vocabSize);
+    }
+
+    // Check if we can reuse cached tokens
+    let cachedTokens = 0;
+
+    if (this.kvCache && this.activeSession && this.kvCache.seqLen > 0) {
+      const cachedIds = this.activeSession.cachedTokenIds;
+      let matchLen = 0;
+      for (let i = 0; i < Math.min(cachedIds.length, fullTokenIds.length); i++) {
+        if (cachedIds[i] === fullTokenIds[i]) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+
+      if (matchLen > 0 && matchLen >= cachedIds.length * 0.8) {
+        cachedTokens = Math.min(matchLen, this.kvCache.seqLen);
+        debugLog(`[ChatStream] Cache hit: ${cachedTokens}/${fullTokenIds.length} tokens matched`);
+      } else if (matchLen < cachedIds.length * 0.5) {
+        debugLog(`[ChatStream] Cache miss: clearing cache`);
+        this.clearKVCache();
+        if (this.activeSession) {
+          this.activeSession.cachedTokenIds = [];
+          this.activeSession.cachedSeqLen = 0;
+        }
+      }
+    }
+
+    debugLog(`[ChatStream] Total: ${fullTokenIds.length} tokens, cached: ${cachedTokens}, prefill: ${fullTokenIds.length - cachedTokens}`);
+
+    // Ensure we have a session for tracking
+    if (!this.activeSession) {
+      this.createSession();
+    }
+
+    // Allocate or check cache capacity
+    const totalNeeded = fullTokenIds.length + maxTokens;
+    if (!this.kvCache || totalNeeded > this.kvCache.maxSeqLen) {
+      if (this.kvCache) {
+        this.clearKVCache();
+      }
+      const maxSeqLen = Math.max(this.contextLength, totalNeeded + 256);
+      this.kvCache = this.createGPUKVCache(maxSeqLen);
+      cachedTokens = 0;
+    }
+
+    // Prefill if needed - capture logits for first token generation
+    let prefillLogits: Tensor | null = null;
+    if (fullTokenIds.length > (this.kvCache?.seqLen ?? 0)) {
+      prefillLogits = await this.forwardTensor(fullTokenIds, true);
+    }
+
+    // Update session state
+    this.activeSession!.messages = [...messages];
+    this.activeSession!.cachedTokenIds = fullTokenIds.slice();
+    this.activeSession!.cachedSeqLen = fullTokenIds.length;
+
+    // Generate and yield tokens
+    const generatedTokens: number[] = [];
+    let generatedText = '';
+    const eosId = this.tokenizer?.eosTokenId ?? 2;
+
+    // Add default stop sequences for Qwen
+    const allStop = [...stop];
+    const arch = this.architecture?.architecture?.toLowerCase();
+    if ((arch === 'qwen2' || arch === 'qwen') && !allStop.includes('<|im_end|>')) {
+      allStop.push('<|im_end|>');
+    }
+
+    while (generatedTokens.length < maxTokens) {
+      let logitsTensor: Tensor;
+
+      if (prefillLogits) {
+        // Use logits from prefill for first token
+        logitsTensor = prefillLogits;
+        prefillLogits = null;
+      } else {
+        // Incremental decode for subsequent tokens
+        const allIds = [...fullTokenIds, ...generatedTokens];
+        logitsTensor = await this.forwardTensor(allIds, true);
+      }
+      const nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
+      logitsTensor.destroy();
+
+      generatedTokens.push(nextToken);
+
+      let tokenText: string;
+      if (this.tokenizer) {
+        tokenText = this.tokenizer.decodeToken(nextToken);
+      } else {
+        tokenText = String.fromCharCode(nextToken % 128);
+      }
+      generatedText += tokenText;
+
+      // Check for EOS
+      if (nextToken === eosId) break;
+
+      // Check for stop sequences
+      let shouldStop = false;
+      for (const stopSeq of allStop) {
+        if (generatedText.endsWith(stopSeq)) {
+          // Don't yield the stop sequence
+          const stopLen = stopSeq.length;
+          if (generatedText.length > stopLen) {
+            // Remove stop sequence from end
+            generatedText = generatedText.slice(0, -stopLen);
+          }
+          shouldStop = true;
+          break;
+        }
+      }
+      if (shouldStop) break;
+
+      // Yield the token
+      yield tokenText;
+    }
+
+    // Update cache with generated tokens
+    this.activeSession!.cachedTokenIds.push(...generatedTokens);
+    this.activeSession!.cachedSeqLen += generatedTokens.length;
+    this.activeSession!.messages.push({ role: 'assistant', content: generatedText });
   }
 
   /**
@@ -2110,53 +2537,42 @@ export class WebGPUEngine extends EventEmitter implements Engine {
           nextToken = this.sampleToken(logits, temperature, topK);
         } else {
           // Normal mode: GPU-accelerated sampling (avoids expensive toArray)
-          const tTokStream = performance.now();
           const logitsTensor = await this.forwardTensor(allIds, true);
-          const fwdTimeStream = performance.now() - tTokStream;
-
-          const tSampStream = performance.now();
           nextToken = await this.sampleTokenGPU(logitsTensor, temperature, topK);
-          const sampTimeStream = performance.now() - tSampStream;
           logitsTensor.destroy();
-
-          const tokTimeStream = performance.now() - tTokStream;
-          // Log timing for every 5th token
-          if (i % 5 === 0) {
-            debugLog(`[Stream#${i}] total=${tokTimeStream.toFixed(0)}ms fwd=${fwdTimeStream.toFixed(0)}ms sample=${sampTimeStream.toFixed(0)}ms`);
-          }
         }
 
         generatedTokens.push(nextToken);
 
-      // Decode and yield the token
-      let tokenText: string;
-      if (this.tokenizer) {
-        tokenText = this.tokenizer.decodeToken(nextToken);
-      } else {
-        tokenText = String.fromCharCode(nextToken % 128);
-      }
+        // Decode and yield the token
+        let tokenText: string;
+        if (this.tokenizer) {
+          tokenText = this.tokenizer.decodeToken(nextToken);
+        } else {
+          tokenText = String.fromCharCode(nextToken % 128);
+        }
 
-      generatedText += tokenText;
-      yield tokenText;
+        generatedText += tokenText;
+        yield tokenText;
 
-      // Check for EOS
-      const eosId = this.tokenizer?.eosTokenId ?? 2;
-      if (nextToken === eosId) {
-        break;
-      }
+        // Check for EOS
+        const eosId = this.tokenizer?.eosTokenId ?? 2;
+        if (nextToken === eosId) {
+          break;
+        }
 
-      // Check for stop sequences
-      let shouldStop = false;
-      for (const stopSeq of stop) {
-        if (generatedText.endsWith(stopSeq)) {
-          shouldStop = true;
+        // Check for stop sequences
+        let shouldStop = false;
+        for (const stopSeq of stop) {
+          if (generatedText.endsWith(stopSeq)) {
+            shouldStop = true;
+            break;
+          }
+        }
+        if (shouldStop) {
           break;
         }
       }
-      if (shouldStop) {
-        break;
-      }
-    }
     } finally {
       // Clear cache after generation to free GPU memory
       this.clearKVCache();
@@ -2299,6 +2715,10 @@ export class WebGPUEngine extends EventEmitter implements Engine {
    */
   async shutdown(): Promise<void> {
     await this.unload();
+
+    // Reset all cached pipelines before destroying device
+    // This is critical when switching models/devices
+    resetAllPipelines();
 
     if (this.gpuDevice) {
       this.gpuDevice.destroy();

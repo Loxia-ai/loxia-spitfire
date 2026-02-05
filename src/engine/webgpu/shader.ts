@@ -437,6 +437,23 @@ export function clearShaderCache(): void {
 }
 
 /**
+ * Reset the global command batcher (call on device destroy)
+ * Clears any pending commands which may reference old device
+ */
+export function resetCommandBatcher(): void {
+  if (commandBatcher) {
+    // Flush any pending commands before resetting
+    // (they may fail on old device, but that's ok during shutdown)
+    try {
+      commandBatcher.flush();
+    } catch {
+      // Ignore errors during shutdown
+    }
+  }
+  commandBatcher = null;
+}
+
+/**
  * Common WGSL utility functions that can be included in shaders
  */
 export const WGSL_UTILS = `

@@ -351,3 +351,14 @@ export function getBufferPool(): BufferPool {
   }
   return globalBufferPool;
 }
+
+/**
+ * Reset the global buffer pool (call on device destroy)
+ * Clears all pooled buffers which may reference old device
+ */
+export function resetBufferPool(): void {
+  if (globalBufferPool) {
+    globalBufferPool.clear();
+  }
+  globalBufferPool = null;
+}

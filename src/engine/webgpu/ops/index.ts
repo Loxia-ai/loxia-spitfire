@@ -1002,6 +1002,10 @@ export async function embeddingLookup(
     throw new Error('Embeddings must be 2D');
   }
 
+  if (indices.length === 0) {
+    throw new Error('embeddingLookup: indices array is empty - no tokens to process');
+  }
+
   if (!embeddingPipeline) {
     embeddingPipeline = createComputePipelineFromSource(EMBEDDING_SHADER, {
       label: 'embedding',
@@ -2628,5 +2632,31 @@ export function sampleFromTopK(probs: Float32Array, indices: Uint32Array): numbe
  * Reset top-k pipeline (for testing)
  */
 export function resetTopKPipeline(): void {
+  topKPipeline = null;
+}
+
+/**
+ * Reset all cached pipelines in ops module
+ * Call this when switching GPU devices (e.g., loading a new model)
+ */
+export function resetAllOpsPipelines(): void {
+  elementwisePipelines = null;
+  binaryPipelines = null;
+  scalarPipelines = null;
+  broadcastAddPipeline = null;
+  matmulPipeline = null;
+  gemvPipeline = null;
+  reducePipelines = null;
+  softmaxPipeline = null;
+  embeddingPipeline = null;
+  causalAttentionPipeline = null;
+  sliceLastRowPipeline = null;
+  sliceLastRowsPipeline = null;
+  copyRowsPipeline = null;
+  transposePipeline = null;
+  fusedSwiGLUPipeline = null;
+  fusedSwiGLUGemvPipeline = null;
+  fusedQKVPipeline = null;
+  fusedQKVGemvPipeline = null;
   topKPipeline = null;
 }

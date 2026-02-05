@@ -15,7 +15,7 @@ import {
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
-import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemvQ6_K, gemmQ8_0, gemmQ4_K, gemmQ6_K, fusedFFNGateUpQ4K, fusedFFNGateUpQ6K } from '../quant/index.js';
+import { QuantizedTensor, gemvQ8_0, gemvQ4_0, gemvQ4_K_optimized, gemvQ6_K, gemmQ8_0, gemmQ4_0, gemmQ4_K, gemmQ6_K, fusedFFNGateUpQ4K, fusedFFNGateUpQ6K } from '../quant/index.js';
 import { GGMLType } from '../../../types/model.js';
 import { debugLog, isDebugEnabled } from '../debug.js';
 
@@ -487,6 +487,207 @@ export async function applyRope(
 }
 
 // ============================================================================
+// Fused RoPE + KV Cache Write
+// ============================================================================
+
+const FUSED_ROPE_KV_CACHE_SHADER = `
+// Fused RoPE + KV Cache Write
+// Combines:
+// 1. Apply RoPE to Q -> output qOut
+// 2. Apply RoPE to K -> write directly to kCache[startPos:]
+// 3. Copy V -> write directly to vCache[startPos:]
+//
+// Saves 4 separate kernel calls (2 rope + 2 copy_rows)
+
+struct Params {
+  seqLen: u32,
+  headDim: u32,
+  numQHeads: u32,
+  numKVHeads: u32,
+  startPos: u32,
+  base: f32,
+  kvDim: u32,       // numKVHeads * headDim
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> qOut: array<f32>;
+@group(0) @binding(4) var<storage, read_write> kCache: array<f32>;
+@group(0) @binding(5) var<storage, read_write> vCache: array<f32>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let seqLen = params.seqLen;
+  let headDim = params.headDim;
+  let numQHeads = params.numQHeads;
+  let numKVHeads = params.numKVHeads;
+  let startPos = params.startPos;
+  let base = params.base;
+  let kvDim = params.kvDim;
+  let halfDim = headDim / 2u;
+
+  let idx = gid.x;
+
+  // Total work: Q rope pairs + K rope pairs + V copy elements
+  let qPairs = seqLen * numQHeads * halfDim;
+  let kPairs = seqLen * numKVHeads * halfDim;
+  let vElems = seqLen * kvDim;
+
+  if (idx < qPairs) {
+    // Apply RoPE to Q
+    let pairIdx = idx;
+    let localPos = pairIdx / (numQHeads * halfDim);
+    let absPos = startPos + localPos;
+    let remainder = pairIdx % (numQHeads * halfDim);
+    let head = remainder / halfDim;
+    let d = remainder % halfDim;
+
+    let theta = f32(absPos) / pow(base, 2.0 * f32(d) / f32(headDim));
+    let cosT = cos(theta);
+    let sinT = sin(theta);
+
+    let baseIdx = (localPos * numQHeads + head) * headDim;
+    let idx1 = baseIdx + d;
+    let idx2 = baseIdx + d + halfDim;
+
+    let x1 = q[idx1];
+    let x2 = q[idx2];
+
+    qOut[idx1] = x1 * cosT - x2 * sinT;
+    qOut[idx2] = x2 * cosT + x1 * sinT;
+  } else if (idx < qPairs + kPairs) {
+    // Apply RoPE to K and write to cache
+    let pairIdx = idx - qPairs;
+    let localPos = pairIdx / (numKVHeads * halfDim);
+    let absPos = startPos + localPos;
+    let remainder = pairIdx % (numKVHeads * halfDim);
+    let head = remainder / halfDim;
+    let d = remainder % halfDim;
+
+    let theta = f32(absPos) / pow(base, 2.0 * f32(d) / f32(headDim));
+    let cosT = cos(theta);
+    let sinT = sin(theta);
+
+    // Input indices (K is [seqLen, numKVHeads * headDim])
+    let inBase = (localPos * numKVHeads + head) * headDim;
+    let inIdx1 = inBase + d;
+    let inIdx2 = inBase + d + halfDim;
+
+    let x1 = k[inIdx1];
+    let x2 = k[inIdx2];
+
+    let k1 = x1 * cosT - x2 * sinT;
+    let k2 = x2 * cosT + x1 * sinT;
+
+    // Output to cache at absolute position
+    let cacheBase = (absPos * numKVHeads + head) * headDim;
+    let cacheIdx1 = cacheBase + d;
+    let cacheIdx2 = cacheBase + d + halfDim;
+
+    kCache[cacheIdx1] = k1;
+    kCache[cacheIdx2] = k2;
+  } else if (idx < qPairs + kPairs + vElems) {
+    // Copy V to cache
+    let vIdx = idx - qPairs - kPairs;
+    let localPos = vIdx / kvDim;
+    let absPos = startPos + localPos;
+    let dimIdx = vIdx % kvDim;
+
+    // Input index
+    let inIdx = localPos * kvDim + dimIdx;
+    // Cache index at absolute position
+    let cacheIdx = absPos * kvDim + dimIdx;
+
+    vCache[cacheIdx] = v[inIdx];
+  }
+}
+`;
+
+let fusedRopeKVCachePipeline: GPUComputePipeline | null = null;
+
+/**
+ * Fused RoPE + KV Cache Write
+ * Applies RoPE to Q and K, writes K and V directly to KV cache
+ * Saves 4 kernel calls per layer (2 rope + 2 copy_rows)
+ *
+ * @param q - Query tensor [seqLen, numQHeads * headDim]
+ * @param k - Key tensor [seqLen, numKVHeads * headDim]
+ * @param v - Value tensor [seqLen, numKVHeads * headDim]
+ * @param kCache - Key cache tensor [maxSeqLen, numKVHeads * headDim]
+ * @param vCache - Value cache tensor [maxSeqLen, numKVHeads * headDim]
+ * @param numQHeads - Number of query heads
+ * @param numKVHeads - Number of key/value heads
+ * @param headDim - Dimension per head
+ * @param startPos - Starting position in cache
+ * @param base - RoPE base frequency
+ * @returns Q with RoPE applied (K and V are written directly to cache)
+ */
+export async function fusedRopeAndKVCache(
+  q: Tensor,
+  k: Tensor,
+  v: Tensor,
+  kCache: Tensor,
+  vCache: Tensor,
+  numQHeads: number,
+  numKVHeads: number,
+  headDim: number,
+  startPos: number,
+  base = 10000.0
+): Promise<Tensor> {
+  if (!fusedRopeKVCachePipeline) {
+    fusedRopeKVCachePipeline = createComputePipelineFromSource(FUSED_ROPE_KV_CACHE_SHADER, {
+      label: 'fused_rope_kv_cache',
+      entryPoint: 'main',
+    });
+  }
+
+  const seqLen = q.shape[0];
+  const kvDim = numKVHeads * headDim;
+
+  const qOut = Tensor.empty(q.shape, { label: 'q_roped' });
+
+  // Params: seqLen, headDim, numQHeads, numKVHeads, startPos, base, kvDim, _pad
+  const paramsData = new ArrayBuffer(32);
+  const paramsView = new DataView(paramsData);
+  paramsView.setUint32(0, seqLen, true);
+  paramsView.setUint32(4, headDim, true);
+  paramsView.setUint32(8, numQHeads, true);
+  paramsView.setUint32(12, numKVHeads, true);
+  paramsView.setUint32(16, startPos, true);
+  paramsView.setFloat32(20, base, true);
+  paramsView.setUint32(24, kvDim, true);
+  paramsView.setUint32(28, 0, true);  // padding
+
+  const params = createUniformBufferWithData(new Uint8Array(paramsData), 'fused_rope_kv_params');
+
+  const bindGroup = createBindGroup(fusedRopeKVCachePipeline, 0, [
+    { binding: 0, resource: q.getBuffer() },
+    { binding: 1, resource: k.getBuffer() },
+    { binding: 2, resource: v.getBuffer() },
+    { binding: 3, resource: qOut.getBuffer() },
+    { binding: 4, resource: kCache.getBuffer() },
+    { binding: 5, resource: vCache.getBuffer() },
+    { binding: 6, resource: params },
+  ]);
+
+  const halfDim = headDim / 2;
+  const totalWork = seqLen * numQHeads * halfDim + seqLen * numKVHeads * halfDim + seqLen * kvDim;
+  const workgroups = calculateWorkgroups(totalWork, 256);
+
+  const usedBuffers = [
+    q.getBuffer(), k.getBuffer(), v.getBuffer(),
+    qOut.getBuffer(), kCache.getBuffer(), vCache.getBuffer(), params
+  ];
+  await executeCompute(fusedRopeKVCachePipeline, [bindGroup], [workgroups, 1, 1], undefined, false, true, usedBuffers);
+
+  requestBufferDestroy(params);
+  return qOut;
+}
+
+// ============================================================================
 // Multi-Head Attention
 // ============================================================================
 
@@ -643,6 +844,8 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
       // GEMV for single-token inference (decode phase)
       if (w.quantType === GGMLType.Q8_0) {
         result = await gemvQ8_0(x, w);
+      } else if (w.quantType === GGMLType.Q4_0) {
+        result = await gemvQ4_0(x, w);
       } else if (w.quantType === GGMLType.Q4_K) {
         result = await gemvQ4_K_optimized(x, w);
       } else if (w.quantType === GGMLType.Q6_K) {
@@ -650,13 +853,15 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
       } else {
         throw new Error(
           `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
-          `Supported: Q8_0, Q4_K, Q6_K`
+          `Supported: Q8_0, Q4_0, Q4_K, Q6_K`
         );
       }
     } else {
       // GEMM for batch inference (prefill phase)
       if (w.quantType === GGMLType.Q8_0) {
         result = await gemmQ8_0(x, w);
+      } else if (w.quantType === GGMLType.Q4_0) {
+        result = await gemmQ4_0(x, w);
       } else if (w.quantType === GGMLType.Q4_K) {
         result = await gemmQ4_K(x, w);
       } else if (w.quantType === GGMLType.Q6_K) {
@@ -664,7 +869,7 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
       } else {
         throw new Error(
           `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
-          `Supported: Q8_0, Q4_K, Q6_K (GEMV only)`
+          `Supported: Q8_0, Q4_0, Q4_K, Q6_K`
         );
       }
     }
@@ -809,11 +1014,12 @@ export async function mlp(
 }
 
 /**
- * Reset all cached pipelines (useful after shader updates)
+ * Reset all cached pipelines (useful after shader updates or device change)
  */
 export function resetLayersPipelines(): void {
   layerNormPipeline = null;
   rmsNormPipeline = null;
   addRmsNormPipeline = null;
   ropePipeline = null;
+  fusedRopeKVCachePipeline = null;
 }

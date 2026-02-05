@@ -70,6 +70,7 @@ export {
   rmsNorm,
   addRmsNorm,
   applyRope,
+  fusedRopeAndKVCache,
   attention,
   feedForward,
   feedForwardQ,
@@ -137,3 +138,36 @@ export {
   destroyGPUProfiler,
   type ProfileResult,
 } from './perf/index.js';
+
+// Import reset functions from all modules
+import { resetLayersPipelines } from './layers/index.js';
+import { resetAllOpsPipelines } from './ops/index.js';
+import { resetQuantPipelines, resetQGemvPipelines } from './quant/index.js';
+import { resetFusedFFNPipeline } from './quant/fused-ffn.js';
+import { resetFusedQKVPipeline } from './quant/fused-qkv.js';
+import { resetOptimizedPipelines } from './quant/qgemv-optimized.js';
+import { clearShaderCache as clearShaderCacheInternal, resetCommandBatcher } from './shader.js';
+import { resetBufferPool } from './buffer.js';
+import { destroyGPUProfiler } from './perf/gpu-profiler.js';
+
+/**
+ * Reset ALL cached WebGPU pipelines and global state across all modules.
+ * MUST be called when switching GPU devices (e.g., before loading a new model
+ * after shutting down the previous engine).
+ */
+export function resetAllPipelines(): void {
+  // Reset global caches that hold device-specific resources
+  clearShaderCacheInternal();
+  resetCommandBatcher();
+  resetBufferPool();
+  destroyGPUProfiler();
+
+  // Reset all pipeline caches
+  resetLayersPipelines();
+  resetAllOpsPipelines();
+  resetQuantPipelines();
+  resetQGemvPipelines();
+  resetFusedFFNPipeline();
+  resetFusedQKVPipeline();
+  resetOptimizedPipelines();
+}
