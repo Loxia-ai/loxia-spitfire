@@ -617,14 +617,21 @@ fn main(
 // ============================================================================
 
 const Q4_K_GEMM_TILED_SHADER = `
-// Tiled Quantized GEMM: Y = X @ W_q4k
+// Heavily Optimized Tiled Q4_K GEMM: Y = X @ W_q4k
 // X: f32 [M, K]
 // W: Q4_K quantized [K, N], stored as raw bytes
 // Y: f32 [M, N]
 //
-// Key optimization: dequantize weight tiles into shared memory ONCE,
-// then reuse across TILE_M=8 input rows. This eliminates redundant
-// dequantization that the non-tiled version does M times per weight.
+// Key optimizations:
+// 1. Read block header (d, dmin, scales) ONCE per Q4_K block, cache in registers
+// 2. Batch u32 reads for qs array (Q4_K is 4-byte aligned: 144 bytes = 36 u32s)
+// 3. Process one sub-block (32 elements) per K-tile, 8 sub-blocks per Q4_K block
+// 4. Tile weights into shared memory and reuse across TILE_M=8 input rows
+//
+// Q4_K Block Format (144 bytes per 256 elements):
+// - offset 0: d (f16) + dmin (f16) = 4 bytes = 1 u32
+// - offset 4: scales[12] = 12 bytes = 3 u32s
+// - offset 16: qs[128] = 128 bytes = 32 u32s
 
 struct Params {
   M: u32,
@@ -638,8 +645,6 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-const BLOCK_SIZE: u32 = 256u;
-const BYTES_PER_BLOCK: u32 = 144u;
 const TILE_M: u32 = 8u;
 const TILE_N: u32 = 64u;
 const TILE_K: u32 = 32u;
@@ -647,16 +652,6 @@ const TILE_K: u32 = 32u;
 // Shared memory for dequantized weights and input tile
 var<workgroup> sharedW: array<f32, 2048>;  // TILE_N * TILE_K = 64 * 32
 var<workgroup> sharedX: array<f32, 256>;   // TILE_M * TILE_K = 8 * 32
-
-fn read_byte(byteOffset: u32) -> u32 {
-  let u32Idx = byteOffset / 4u;
-  let byteInU32 = byteOffset % 4u;
-  return (W_quant[u32Idx] >> (byteInU32 * 8u)) & 0xFFu;
-}
-
-fn read_u16(byteOffset: u32) -> u32 {
-  return read_byte(byteOffset) | (read_byte(byteOffset + 1u) << 8u);
-}
 
 fn unpack_f16(packed: u32) -> f32 {
   let sign = (packed >> 15u) & 1u;
@@ -673,47 +668,6 @@ fn unpack_f16(packed: u32) -> f32 {
   return select(1.0, -1.0, sign == 1u) * m * pow(2.0, f32(e));
 }
 
-// Dequantize a single Q4_K element given global k and n indices
-fn dequant_q4k(k: u32, n: u32, K: u32) -> f32 {
-  let linearIdx = n * K + k;
-  let blockIdx = linearIdx / BLOCK_SIZE;
-  let posInBlock = linearIdx % BLOCK_SIZE;
-  let blockByteOffset = blockIdx * BYTES_PER_BLOCK;
-
-  let dBits = read_u16(blockByteOffset);
-  let dminBits = read_u16(blockByteOffset + 2u);
-  let d = unpack_f16(dBits);
-  let dmin = unpack_f16(dminBits);
-
-  let subBlock = posInBlock / 32u;
-  let posInSubBlock = posInBlock % 32u;
-
-  // Get scale and min for this sub-block
-  let scalesOffset = blockByteOffset + 4u;
-  var sc: u32;
-  var mn: u32;
-  if (subBlock < 4u) {
-    sc = read_byte(scalesOffset + subBlock) & 0x3Fu;
-    mn = read_byte(scalesOffset + subBlock + 4u) & 0x3Fu;
-  } else {
-    let jm4 = subBlock - 4u;
-    sc = (read_byte(scalesOffset + subBlock + 4u) & 0x0Fu) | ((read_byte(scalesOffset + jm4) >> 6u) << 4u);
-    mn = (read_byte(scalesOffset + subBlock + 4u) >> 4u) | ((read_byte(scalesOffset + subBlock) >> 6u) << 4u);
-  }
-
-  let qsOffset = blockByteOffset + 16u;
-  let byteIndex = (subBlock / 2u) * 32u + posInSubBlock;
-  let qByte = read_byte(qsOffset + byteIndex);
-  var q: u32;
-  if ((subBlock & 1u) == 0u) {
-    q = qByte & 0x0Fu;
-  } else {
-    q = qByte >> 4u;
-  }
-
-  return d * f32(sc) * f32(q) - dmin * f32(mn);
-}
-
 @compute @workgroup_size(64)
 fn main(
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -724,15 +678,11 @@ fn main(
   let N = params.N;
   let K = params.K;
 
-  // This workgroup handles:
-  //   columns: [wid.x * TILE_N .. wid.x * TILE_N + 63]
-  //   rows:    [wid.y * TILE_M .. wid.y * TILE_M + 7]
   let colBase = wid.x * TILE_N;
   let rowBase = wid.y * TILE_M;
-  let col = colBase + tid;  // Each thread owns one output column
+  let col = colBase + tid;
   let validCol = col < N;
 
-  // Accumulators for TILE_M rows
   var acc0: f32 = 0.0;
   var acc1: f32 = 0.0;
   var acc2: f32 = 0.0;
@@ -742,60 +692,119 @@ fn main(
   var acc6: f32 = 0.0;
   var acc7: f32 = 0.0;
 
-  let numKTiles = (K + TILE_K - 1u) / TILE_K;
+  let blocksPerCol = K >> 8u;  // K / 256 (Q4_K blocks)
+  let numKTiles = K >> 5u;     // K / 32 (sub-blocks)
+
+  // Cache for block header - refreshed every 8 K-tiles (one Q4_K block)
+  var ds: array<f32, 8>;
+  var dm: array<f32, 8>;
+  var blockU32Idx: u32 = 0u;
+  var lastBlkIdx: u32 = 0xFFFFFFFFu;
 
   for (var kt = 0u; kt < numKTiles; kt++) {
-    let kStart = kt * TILE_K;
-    let kEnd = min(kStart + TILE_K, K);
-    let tileLen = kEnd - kStart;
+    let kStart = kt << 5u;  // kt * 32
+    let blkIdx = kt >> 3u;  // kt / 8 = which Q4_K block
+    let subBlk = kt & 7u;   // kt % 8 = which sub-block within Q4_K block
 
-    // Step 1: Cooperatively load dequantized weights into shared memory
-    // Each thread dequantizes TILE_K values for its column
-    // sharedW layout: sharedW[tid * TILE_K + kk] = W[kStart+kk, col]
+    // Step 1: Dequantize weights for this K-tile into shared memory
     if (validCol) {
-      for (var kk = 0u; kk < tileLen; kk++) {
-        sharedW[tid * TILE_K + kk] = dequant_q4k(kStart + kk, col, K);
+      // Refresh block header cache when entering new Q4_K block
+      if (blkIdx != lastBlkIdx) {
+        lastBlkIdx = blkIdx;
+        blockU32Idx = (col * blocksPerCol + blkIdx) * 36u;
+
+        let dPacked = W_quant[blockU32Idx];
+        let d = unpack_f16(dPacked & 0xFFFFu);
+        let dmin = unpack_f16(dPacked >> 16u);
+
+        let sc0 = W_quant[blockU32Idx + 1u];
+        let sc1 = W_quant[blockU32Idx + 2u];
+        let sc2 = W_quant[blockU32Idx + 3u];
+
+        // Extract and pre-compute d*scale, dmin*min for all 8 sub-blocks
+        ds[0] = d * f32(sc0 & 0x3Fu);
+        ds[1] = d * f32((sc0 >> 8u) & 0x3Fu);
+        ds[2] = d * f32((sc0 >> 16u) & 0x3Fu);
+        ds[3] = d * f32((sc0 >> 24u) & 0x3Fu);
+        dm[0] = dmin * f32(sc1 & 0x3Fu);
+        dm[1] = dmin * f32((sc1 >> 8u) & 0x3Fu);
+        dm[2] = dmin * f32((sc1 >> 16u) & 0x3Fu);
+        dm[3] = dmin * f32((sc1 >> 24u) & 0x3Fu);
+
+        ds[4] = d * f32((sc2 & 0x0Fu) | ((sc0 >> 2u) & 0x30u));
+        ds[5] = d * f32(((sc2 >> 8u) & 0x0Fu) | ((sc0 >> 10u) & 0x30u));
+        ds[6] = d * f32(((sc2 >> 16u) & 0x0Fu) | ((sc0 >> 18u) & 0x30u));
+        ds[7] = d * f32(((sc2 >> 24u) & 0x0Fu) | ((sc0 >> 26u) & 0x30u));
+        dm[4] = dmin * f32(((sc2 >> 4u) & 0x0Fu) | ((sc1 >> 2u) & 0x30u));
+        dm[5] = dmin * f32(((sc2 >> 12u) & 0x0Fu) | ((sc1 >> 10u) & 0x30u));
+        dm[6] = dmin * f32(((sc2 >> 20u) & 0x0Fu) | ((sc1 >> 18u) & 0x30u));
+        dm[7] = dmin * f32(((sc2 >> 28u) & 0x0Fu) | ((sc1 >> 26u) & 0x30u));
+      }
+
+      // Dequantize 32 elements for this sub-block
+      let dsVal = ds[subBlk];
+      let dmVal = dm[subBlk];
+      let pair = subBlk >> 1u;      // 0,0,1,1,2,2,3,3
+      let isOdd = subBlk & 1u;      // 0,1,0,1,0,1,0,1
+      let qsU32Base = blockU32Idx + 4u + pair * 8u;
+      let wBase = tid * TILE_K;
+
+      // Read 8 u32s (32 bytes) and extract 32 4-bit values
+      for (var w = 0u; w < 8u; w++) {
+        let packed = W_quant[qsU32Base + w];
+        let idx = w * 4u;
+
+        if (isOdd == 0u) {
+          // Even sub-block: use low nibbles
+          sharedW[wBase + idx] = dsVal * f32(packed & 0xFu) - dmVal;
+          sharedW[wBase + idx + 1u] = dsVal * f32((packed >> 8u) & 0xFu) - dmVal;
+          sharedW[wBase + idx + 2u] = dsVal * f32((packed >> 16u) & 0xFu) - dmVal;
+          sharedW[wBase + idx + 3u] = dsVal * f32((packed >> 24u) & 0xFu) - dmVal;
+        } else {
+          // Odd sub-block: use high nibbles
+          sharedW[wBase + idx] = dsVal * f32((packed >> 4u) & 0xFu) - dmVal;
+          sharedW[wBase + idx + 1u] = dsVal * f32((packed >> 12u) & 0xFu) - dmVal;
+          sharedW[wBase + idx + 2u] = dsVal * f32((packed >> 20u) & 0xFu) - dmVal;
+          sharedW[wBase + idx + 3u] = dsVal * f32((packed >> 28u) & 0xFu) - dmVal;
+        }
       }
     } else {
-      // Zero out to avoid garbage reads
-      for (var kk = 0u; kk < TILE_K; kk++) {
-        sharedW[tid * TILE_K + kk] = 0.0;
+      let wBase = tid * TILE_K;
+      for (var i = 0u; i < TILE_K; i++) {
+        sharedW[wBase + i] = 0.0;
       }
     }
 
-    // Step 2: Cooperatively load X tile into shared memory
-    // sharedX layout: sharedX[m * TILE_K + kk]
-    // 64 threads loading up to 8*32=256 values, 4 values per thread
-    let xLoadCount = TILE_M * tileLen;
-    let loadsPerThread = (xLoadCount + 63u) / 64u;
-    for (var i = 0u; i < loadsPerThread; i++) {
-      let flatIdx = tid + i * 64u;
-      if (flatIdx < xLoadCount) {
-        let mLocal = flatIdx / tileLen;
-        let kk = flatIdx % tileLen;
-        let globalRow = rowBase + mLocal;
-        if (globalRow < M) {
-          sharedX[mLocal * TILE_K + kk] = X[globalRow * K + kStart + kk];
-        } else {
-          sharedX[mLocal * TILE_K + kk] = 0.0;
-        }
+    // Step 2: Cooperatively load X tile (8 rows × 32 cols = 256 values)
+    // 64 threads, 4 values each
+    for (var i = 0u; i < 4u; i++) {
+      let flatIdx = tid * 4u + i;
+      let mLocal = flatIdx >> 5u;  // flatIdx / 32
+      let kk = flatIdx & 31u;      // flatIdx % 32
+      let globalRow = rowBase + mLocal;
+      if (globalRow < M) {
+        sharedX[flatIdx] = X[globalRow * K + kStart + kk];
+      } else {
+        sharedX[flatIdx] = 0.0;
       }
     }
 
     workgroupBarrier();
 
-    // Step 3: Accumulate — each thread processes its column across all M rows
-    let wBase = tid * TILE_K;
-    for (var kk = 0u; kk < tileLen; kk++) {
-      let wVal = sharedW[wBase + kk];
-      acc0 += sharedX[0u * TILE_K + kk] * wVal;
-      acc1 += sharedX[1u * TILE_K + kk] * wVal;
-      acc2 += sharedX[2u * TILE_K + kk] * wVal;
-      acc3 += sharedX[3u * TILE_K + kk] * wVal;
-      acc4 += sharedX[4u * TILE_K + kk] * wVal;
-      acc5 += sharedX[5u * TILE_K + kk] * wVal;
-      acc6 += sharedX[6u * TILE_K + kk] * wVal;
-      acc7 += sharedX[7u * TILE_K + kk] * wVal;
+    // Step 3: Accumulate
+    if (validCol) {
+      let wBase = tid * TILE_K;
+      for (var kk = 0u; kk < TILE_K; kk++) {
+        let wVal = sharedW[wBase + kk];
+        acc0 += sharedX[kk] * wVal;
+        acc1 += sharedX[TILE_K + kk] * wVal;
+        acc2 += sharedX[2u * TILE_K + kk] * wVal;
+        acc3 += sharedX[3u * TILE_K + kk] * wVal;
+        acc4 += sharedX[4u * TILE_K + kk] * wVal;
+        acc5 += sharedX[5u * TILE_K + kk] * wVal;
+        acc6 += sharedX[6u * TILE_K + kk] * wVal;
+        acc7 += sharedX[7u * TILE_K + kk] * wVal;
+      }
     }
 
     workgroupBarrier();
@@ -1167,12 +1176,18 @@ async function gemmQ4_K_tiled(
 // ============================================================================
 
 const Q6_K_GEMV_SHADER = `
-// Optimized Q6_K GEMV: y = x @ W_q6k
+// Heavily Optimized Q6_K GEMV: y = x @ W_q6k
 // Key optimizations:
-// 1. Pre-compute d * scale products once per chunk (8 scales)
-// 2. Process 4 quadrants simultaneously for each l value
-// 3. Use shared memory for X values
-// 4. Minimize redundant byte reads
+// 1. Batch u32 reads: read_4bytes() reads 4 consecutive bytes in 1-2 fetches
+// 2. Process 4 l values per iteration (16 q values at once)
+// 3. Pre-compute d * scale products for all 8 scales per chunk
+// 4. Use shared memory for X values
+//
+// Q6_K Block Format (210 bytes per 256 elements):
+// - ql[128] at offset 0: low 4 bits of each q value
+// - qh[64] at offset 128: high 2 bits packed (4 q values per byte)
+// - scales[16] at offset 192: signed int8 scales for 16 sub-blocks
+// - d at offset 208: f16 block scale
 
 struct Params {
   N: u32,
@@ -1191,10 +1206,18 @@ const WG_SIZE: u32 = 256u;
 
 var<workgroup> sharedX: array<f32, 256>;
 
-fn read_byte(byteOffset: u32) -> u32 {
+// Read 4 consecutive bytes as u32, handles unaligned access
+fn read_4bytes(byteOffset: u32) -> u32 {
   let u32Idx = byteOffset >> 2u;
   let byteInU32 = byteOffset & 3u;
-  return (W_quant[u32Idx] >> (byteInU32 << 3u)) & 0xFFu;
+  if (byteInU32 == 0u) {
+    return W_quant[u32Idx];
+  } else {
+    let shift = byteInU32 << 3u;
+    let lo = W_quant[u32Idx] >> shift;
+    let hi = W_quant[u32Idx + 1u] << (32u - shift);
+    return lo | hi;
+  }
 }
 
 fn read_u16(byteOffset: u32) -> u32 {
@@ -1263,40 +1286,88 @@ fn main(
         let scBase = blockByteOffset + 192u + chunk * 8u;
         let outBase = chunk * 128u;
 
-        // Read and pre-multiply all 8 scales for this chunk
-        let ds0 = d * f32(int8_to_i32(read_byte(scBase + 0u)));
-        let ds1 = d * f32(int8_to_i32(read_byte(scBase + 1u)));
-        let ds2 = d * f32(int8_to_i32(read_byte(scBase + 2u)));
-        let ds3 = d * f32(int8_to_i32(read_byte(scBase + 3u)));
-        let ds4 = d * f32(int8_to_i32(read_byte(scBase + 4u)));
-        let ds5 = d * f32(int8_to_i32(read_byte(scBase + 5u)));
-        let ds6 = d * f32(int8_to_i32(read_byte(scBase + 6u)));
-        let ds7 = d * f32(int8_to_i32(read_byte(scBase + 7u)));
+        // Read all 8 scales in 2 u32 reads and pre-multiply with d
+        let sc_0_3 = read_4bytes(scBase);
+        let sc_4_7 = read_4bytes(scBase + 4u);
+        let ds0 = d * f32(int8_to_i32(sc_0_3 & 0xFFu));
+        let ds1 = d * f32(int8_to_i32((sc_0_3 >> 8u) & 0xFFu));
+        let ds2 = d * f32(int8_to_i32((sc_0_3 >> 16u) & 0xFFu));
+        let ds3 = d * f32(int8_to_i32((sc_0_3 >> 24u) & 0xFFu));
+        let ds4 = d * f32(int8_to_i32(sc_4_7 & 0xFFu));
+        let ds5 = d * f32(int8_to_i32((sc_4_7 >> 8u) & 0xFFu));
+        let ds6 = d * f32(int8_to_i32((sc_4_7 >> 16u) & 0xFFu));
+        let ds7 = d * f32(int8_to_i32((sc_4_7 >> 24u) & 0xFFu));
 
-        // Process l = 0..31, handling all 4 quadrants at once
-        for (var l = 0u; l < 32u; l++) {
-          let ql_l = read_byte(qlBase + l);
-          let ql_l32 = read_byte(qlBase + l + 32u);
-          let qh_l = read_byte(qhBase + l);
+        // Process 8 iterations of 4 l values each (32 total)
+        // Each iteration: read 4 ql bytes, 4 ql+32 bytes, 4 qh bytes
+        for (var i = 0u; i < 8u; i++) {
+          let l = i * 4u;
 
-          // Extract 6-bit quantized values for all 4 quadrants
-          let q1 = i32((ql_l & 0xFu) | (((qh_l >> 0u) & 3u) << 4u)) - 32;
-          let q2 = i32((ql_l32 & 0xFu) | (((qh_l >> 2u) & 3u) << 4u)) - 32;
-          let q3 = i32((ql_l >> 4u) | (((qh_l >> 4u) & 3u) << 4u)) - 32;
-          let q4 = i32((ql_l32 >> 4u) | (((qh_l >> 6u) & 3u) << 4u)) - 32;
+          // Read 4 consecutive bytes for ql[l..l+3], ql[l+32..l+35], qh[l..l+3]
+          let ql_lo = read_4bytes(qlBase + l);
+          let ql_hi = read_4bytes(qlBase + l + 32u);
+          let qh_packed = read_4bytes(qhBase + l);
 
-          // Select scales: is=0 for l<16, is=1 for l>=16
+          // Extract individual bytes
+          let ql0 = ql_lo & 0xFFu;
+          let ql1 = (ql_lo >> 8u) & 0xFFu;
+          let ql2 = (ql_lo >> 16u) & 0xFFu;
+          let ql3 = (ql_lo >> 24u) & 0xFFu;
+          let ql32_0 = ql_hi & 0xFFu;
+          let ql32_1 = (ql_hi >> 8u) & 0xFFu;
+          let ql32_2 = (ql_hi >> 16u) & 0xFFu;
+          let ql32_3 = (ql_hi >> 24u) & 0xFFu;
+          let qh0 = qh_packed & 0xFFu;
+          let qh1 = (qh_packed >> 8u) & 0xFFu;
+          let qh2 = (qh_packed >> 16u) & 0xFFu;
+          let qh3 = (qh_packed >> 24u) & 0xFFu;
+
+          // Select scales: l<16 uses ds0/ds2/ds4/ds6, l>=16 uses ds1/ds3/ds5/ds7
           let useHigh = l >= 16u;
           let s1 = select(ds0, ds1, useHigh);
           let s2 = select(ds2, ds3, useHigh);
           let s3 = select(ds4, ds5, useHigh);
           let s4 = select(ds6, ds7, useHigh);
 
-          // Accumulate all 4 quadrants
-          acc += sharedX[outBase + l] * s1 * f32(q1);
-          acc += sharedX[outBase + l + 32u] * s2 * f32(q2);
-          acc += sharedX[outBase + l + 64u] * s3 * f32(q3);
-          acc += sharedX[outBase + l + 96u] * s4 * f32(q4);
+          // Process l+0
+          let q1_0 = i32((ql0 & 0xFu) | (((qh0 >> 0u) & 3u) << 4u)) - 32;
+          let q2_0 = i32((ql32_0 & 0xFu) | (((qh0 >> 2u) & 3u) << 4u)) - 32;
+          let q3_0 = i32((ql0 >> 4u) | (((qh0 >> 4u) & 3u) << 4u)) - 32;
+          let q4_0 = i32((ql32_0 >> 4u) | (((qh0 >> 6u) & 3u) << 4u)) - 32;
+          acc += sharedX[outBase + l] * s1 * f32(q1_0);
+          acc += sharedX[outBase + l + 32u] * s2 * f32(q2_0);
+          acc += sharedX[outBase + l + 64u] * s3 * f32(q3_0);
+          acc += sharedX[outBase + l + 96u] * s4 * f32(q4_0);
+
+          // Process l+1
+          let q1_1 = i32((ql1 & 0xFu) | (((qh1 >> 0u) & 3u) << 4u)) - 32;
+          let q2_1 = i32((ql32_1 & 0xFu) | (((qh1 >> 2u) & 3u) << 4u)) - 32;
+          let q3_1 = i32((ql1 >> 4u) | (((qh1 >> 4u) & 3u) << 4u)) - 32;
+          let q4_1 = i32((ql32_1 >> 4u) | (((qh1 >> 6u) & 3u) << 4u)) - 32;
+          acc += sharedX[outBase + l + 1u] * s1 * f32(q1_1);
+          acc += sharedX[outBase + l + 33u] * s2 * f32(q2_1);
+          acc += sharedX[outBase + l + 65u] * s3 * f32(q3_1);
+          acc += sharedX[outBase + l + 97u] * s4 * f32(q4_1);
+
+          // Process l+2
+          let q1_2 = i32((ql2 & 0xFu) | (((qh2 >> 0u) & 3u) << 4u)) - 32;
+          let q2_2 = i32((ql32_2 & 0xFu) | (((qh2 >> 2u) & 3u) << 4u)) - 32;
+          let q3_2 = i32((ql2 >> 4u) | (((qh2 >> 4u) & 3u) << 4u)) - 32;
+          let q4_2 = i32((ql32_2 >> 4u) | (((qh2 >> 6u) & 3u) << 4u)) - 32;
+          acc += sharedX[outBase + l + 2u] * s1 * f32(q1_2);
+          acc += sharedX[outBase + l + 34u] * s2 * f32(q2_2);
+          acc += sharedX[outBase + l + 66u] * s3 * f32(q3_2);
+          acc += sharedX[outBase + l + 98u] * s4 * f32(q4_2);
+
+          // Process l+3
+          let q1_3 = i32((ql3 & 0xFu) | (((qh3 >> 0u) & 3u) << 4u)) - 32;
+          let q2_3 = i32((ql32_3 & 0xFu) | (((qh3 >> 2u) & 3u) << 4u)) - 32;
+          let q3_3 = i32((ql3 >> 4u) | (((qh3 >> 4u) & 3u) << 4u)) - 32;
+          let q4_3 = i32((ql32_3 >> 4u) | (((qh3 >> 6u) & 3u) << 4u)) - 32;
+          acc += sharedX[outBase + l + 3u] * s1 * f32(q1_3);
+          acc += sharedX[outBase + l + 35u] * s2 * f32(q2_3);
+          acc += sharedX[outBase + l + 67u] * s3 * f32(q3_3);
+          acc += sharedX[outBase + l + 99u] * s4 * f32(q4_3);
         }
       }
     }
