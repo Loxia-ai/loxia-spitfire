@@ -24,16 +24,16 @@ import { GGMLType } from '../../../types/model.js';
 export { QuantizedTensor, type SupportedQuantType } from './qtensor.js';
 
 // Re-export quantized GEMV/GEMM operations
-export { gemvQ8_0, gemvQ4_K, gemmQ8_0, gemmQ4_K, resetQGemvPipelines } from './qgemv.js';
+export { gemvQ8_0, gemvQ4_K, gemvQ6_K, gemmQ8_0, gemmQ4_K, gemmQ6_K, resetQGemvPipelines } from './qgemv.js';
 
 // Re-export optimized quantized GEMV operations (Phase 1: Memory Coalescing)
 export { gemvQ4_K_optimized, resetOptimizedPipelines } from './qgemv-optimized.js';
 
 // Re-export fused QKV projection for quantized weights
-export { fusedQKVProjectionQ4K, resetFusedQKVPipeline } from './fused-qkv.js';
+export { fusedQKVProjectionQ4K, fusedQKVProjectionQ4KBias, fusedQKVProjectionQ6K, resetFusedQKVPipeline } from './fused-qkv.js';
 
 // Re-export fused FFN gate+up for quantized weights
-export { fusedFFNGateUpQ4K, resetFusedFFNPipeline } from './fused-ffn.js';
+export { fusedFFNGateUpQ4K, fusedFFNGateUpQ6K, resetFusedFFNPipeline } from './fused-ffn.js';
 
 // ============================================================================
 // Q4_0 Quantization

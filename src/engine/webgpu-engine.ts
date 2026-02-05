@@ -27,9 +27,9 @@ import {
   type LlamaLayerWeights,
 } from './webgpu/index.js';
 import { topKSoftmaxGPU, sampleFromTopK } from './webgpu/ops/index.js';
-import { fusedQKVProjectionQ4K } from './webgpu/quant/index.js';
+import { fusedQKVProjectionQ4K, fusedQKVProjectionQ6K } from './webgpu/quant/index.js';
 import { extractArchitecture, getChatTemplate } from '../model/gguf.js';
-import type { GGUFFile, ModelArchitecture } from '../types/model.js';
+import { GGMLType, type GGUFFile, type ModelArchitecture } from '../types/model.js';
 import { Tokenizer, parseGGUFWithTokenizer } from '../tokenizer/index.js';
 import {
   NgramDraftCache,
@@ -573,7 +573,17 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     let totalFfnTime = 0;
     let layerT0: number;
 
-    for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
+    const numLayersF = this.weights.layers.length;
+    // Pre-compute first layer's pre-attention norm
+    let normedF: Tensor | null = null;
+    {
+      const firstLayer = this.weights.layers[0];
+      if (firstLayer?.attnNorm) {
+        normedF = await rmsNorm(hidden, firstLayer.attnNorm, this.rmsNormEps);
+      }
+    }
+
+    for (let layerIdx = 0; layerIdx < numLayersF; layerIdx++) {
       const layer = this.weights.layers[layerIdx];
 
       // Skip layers without required weights
@@ -581,8 +591,8 @@ export class WebGPUEngine extends EventEmitter implements Engine {
         continue;
       }
 
-      // Pre-attention norm
-      const normed = await rmsNorm(hidden, layer.attnNorm, this.rmsNormEps);
+      // normedF is already computed (from previous layer's fusion or initial computation)
+      const normed = normedF!;
 
       // Debug: check normalized input for layer 0
       if (layerIdx === 0 && DEBUG) {
@@ -642,11 +652,23 @@ export class WebGPUEngine extends EventEmitter implements Engine {
           debugLog(`[Layer0] FFN out last pos: [${lastPosFfn.map(v => v.toFixed(4)).join(', ')}]`);
         }
 
-        // Residual connection
-        const afterFfn = await ops.add(hidden, ffnOut);
-        hidden.destroy();
-        ffnOut.destroy();
-        hidden = afterFfn;
+        // Check if we can fuse post-FFN add + next layer's pre-attention norm
+        const nextLayer = layerIdx + 1 < numLayersF ? this.weights.layers[layerIdx + 1] : null;
+        if (nextLayer?.attnNorm) {
+          const fused = await addRmsNorm(hidden, ffnOut, nextLayer.attnNorm, this.rmsNormEps);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = fused.sum;
+          normedF = fused.normed;
+        } else {
+          const afterFfn = await ops.add(hidden, ffnOut);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = afterFfn;
+          normedF = null;
+        }
+      } else {
+        normedF = null;
       }
       totalFfnTime += performance.now() - layerT0;
       normed2.destroy();
@@ -785,21 +807,30 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     }
     if (shouldProfile) prof['embed'] = performance.now() - tProf;
 
-    // Process through all layers
+    // Process through all layers with fused add+rmsNorm between layers
     if (shouldProfile) tProf = performance.now();
-    for (let layerIdx = 0; layerIdx < this.weights.layers.length; layerIdx++) {
+    const numLayers = this.weights.layers.length;
+    // Pre-compute first layer's pre-attention norm
+    let normed: Tensor | null = null;
+    {
+      const firstLayer = this.weights.layers[0];
+      if (firstLayer?.attnNorm) {
+        normed = await rmsNorm(hidden, firstLayer.attnNorm, this.rmsNormEps);
+      }
+    }
+
+    for (let layerIdx = 0; layerIdx < numLayers; layerIdx++) {
       const layer = this.weights.layers[layerIdx];
       if (!layer.attnNorm || !layer.ffnNorm) continue;
 
-      // Pre-attention norm
-      const normed = await rmsNorm(hidden, layer.attnNorm, this.rmsNormEps);
+      // normed is already computed (from previous layer's fusion or initial computation)
 
       // Self-attention
       let attnOut: Tensor;
       if (layer.attnQ && layer.attnK && layer.attnV && layer.attnOutput) {
-        attnOut = await this.selfAttention(normed, layer, processLen, startPos, layerIdx, useCache);
+        attnOut = await this.selfAttention(normed!, layer, processLen, startPos, layerIdx, useCache);
       } else {
-        attnOut = normed;
+        attnOut = normed!;
       }
 
       // Fused residual add + pre-FFN norm (saves one dispatch)
@@ -808,7 +839,7 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       );
       hidden.destroy();
       if (attnOut !== normed) {
-        normed.destroy();
+        normed!.destroy();
         attnOut.destroy();
       }
       hidden = afterAttn;
@@ -816,10 +847,26 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       // FFN
       if (layer.ffnGate && layer.ffnUp && layer.ffnDown) {
         const ffnOut = await feedForwardQ(normed2, layer.ffnGate, layer.ffnUp, layer.ffnDown);
-        const afterFfn = await ops.add(hidden, ffnOut);
-        hidden.destroy();
-        ffnOut.destroy();
-        hidden = afterFfn;
+
+        // Check if we can fuse post-FFN add + next layer's pre-attention norm
+        const nextLayer = layerIdx + 1 < numLayers ? this.weights.layers[layerIdx + 1] : null;
+        if (nextLayer?.attnNorm) {
+          // Fused: add(hidden, ffnOut) + rmsNorm(sum, nextAttnNorm) → saves another dispatch
+          const fused = await addRmsNorm(hidden, ffnOut, nextLayer.attnNorm, this.rmsNormEps);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = fused.sum;
+          normed = fused.normed;
+        } else {
+          // Last layer: just add, no next norm to fuse with
+          const afterFfn = await ops.add(hidden, ffnOut);
+          hidden.destroy();
+          ffnOut.destroy();
+          hidden = afterFfn;
+          normed = null;
+        }
+      } else {
+        normed = null;
       }
       normed2.destroy();
     }
@@ -924,12 +971,20 @@ export class WebGPUEngine extends EventEmitter implements Engine {
     // Embedding lookup (pass token IDs as number[], not Tensor)
     let hidden = await ops.embeddingLookup(this.weights.tokenEmbedding!, tokensToProcess, this.vocabSize);
 
-    // Process through all layers
+    // Process through all layers with fused add+rmsNorm between layers
+    let normedM: Tensor | null = null;
+    {
+      const firstLayer = this.weights.layers[0];
+      if (firstLayer?.attnNorm) {
+        normedM = await rmsNorm(hidden, firstLayer.attnNorm, this.rmsNormEps);
+      }
+    }
+
     for (let layerIdx = 0; layerIdx < this.numLayers; layerIdx++) {
       const layer = this.weights.layers[layerIdx];
 
-      // Pre-attention norm
-      const normed1 = await rmsNorm(hidden, layer.attnNorm!, this.rmsNormEps);
+      // normedM is already computed (from previous layer's fusion or initial computation)
+      const normed1 = normedM!;
 
       // Self-attention
       const attnOut = await this.selfAttention(
@@ -959,11 +1014,21 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       );
       normed2.destroy();
 
-      // Residual connection
-      const afterFFN = await ops.add(hidden, ffnOut);
-      hidden.destroy();
-      ffnOut.destroy();
-      hidden = afterFFN;
+      // Fuse post-FFN add + next layer's pre-attention norm
+      const nextLayer = layerIdx + 1 < this.numLayers ? this.weights.layers[layerIdx + 1] : null;
+      if (nextLayer?.attnNorm) {
+        const fused = await addRmsNorm(hidden, ffnOut, nextLayer.attnNorm, this.rmsNormEps);
+        hidden.destroy();
+        ffnOut.destroy();
+        hidden = fused.sum;
+        normedM = fused.normed;
+      } else {
+        const afterFFN = await ops.add(hidden, ffnOut);
+        hidden.destroy();
+        ffnOut.destroy();
+        hidden = afterFFN;
+        normedM = null;
+      }
     }
 
     // Update KV cache sequence length
@@ -1041,10 +1106,16 @@ export class WebGPUEngine extends EventEmitter implements Engine {
 
     if (hasQuantizedQKV) {
       // Quantized path
+      // Check if ALL QKV weights are specifically Q4_K or Q6_K (required for fused kernels)
       const allQ4K =
-        layer.attnQ instanceof QuantizedTensor &&
-        layer.attnK instanceof QuantizedTensor &&
-        layer.attnV instanceof QuantizedTensor;
+        layer.attnQ instanceof QuantizedTensor && layer.attnQ.quantType === GGMLType.Q4_K &&
+        layer.attnK instanceof QuantizedTensor && layer.attnK.quantType === GGMLType.Q4_K &&
+        layer.attnV instanceof QuantizedTensor && layer.attnV.quantType === GGMLType.Q4_K;
+
+      const allQ6K =
+        layer.attnQ instanceof QuantizedTensor && layer.attnQ.quantType === GGMLType.Q6_K &&
+        layer.attnK instanceof QuantizedTensor && layer.attnK.quantType === GGMLType.Q6_K &&
+        layer.attnV instanceof QuantizedTensor && layer.attnV.quantType === GGMLType.Q6_K;
 
       // Use fused GEMV only for single-token (M=1) incremental decoding
       // For prefill (M>1), use separate GEMM operations
@@ -1053,6 +1124,17 @@ export class WebGPUEngine extends EventEmitter implements Engine {
       if (allQ4K && M === 1) {
         // Fused Q4_K GEMV - single kernel, reads x once
         const result = await fusedQKVProjectionQ4K(
+          x,
+          layer.attnQ as QuantizedTensor,
+          layer.attnK as QuantizedTensor,
+          layer.attnV as QuantizedTensor
+        );
+        q = result.Q;
+        k = result.K;
+        vProj = result.V;
+      } else if (allQ6K && M === 1) {
+        // Fused Q6_K GEMV - single kernel, reads x once
+        const result = await fusedQKVProjectionQ6K(
           x,
           layer.attnQ as QuantizedTensor,
           layer.attnK as QuantizedTensor,

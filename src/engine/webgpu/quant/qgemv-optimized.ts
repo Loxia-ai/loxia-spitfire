@@ -25,146 +25,52 @@ import { GGMLType } from '../../../types/model.js';
 // ============================================================================
 
 const Q4_K_GEMV_OPTIMIZED_SHADER = `
-// Optimized Quantized GEMV: y = x @ W_q4k
+// Heavily Optimized Q4_K GEMV with Block-Level Processing
 // x: f32 [1, K]
 // W: Q4_K quantized [K, N], stored as raw bytes
 // y: f32 [1, N]
 //
-// Phase 1 Optimizations:
-// 1. Shared memory for dequantized weight tiles
-// 2. Bit operations instead of division/modulo (block sizes are powers of 2)
-// 3. Cooperative dequantization with better memory access
+// Key optimizations:
+// 1. Process entire Q4_K blocks (256 elements) at once
+// 2. Read block header (d, dmin) ONCE per block
+// 3. Pre-compute d*scale and dmin*min for all 8 sub-blocks
+// 4. Batch u32 reads for qs array (4 bytes = 8 q values)
+// 5. Q4_K blocks are 144 bytes = 36 u32s (4-byte aligned!)
 //
 // Q4_K Block Format (144 bytes per 256 elements):
-// - d (f16, 2 bytes): scale multiplier
-// - dmin (f16, 2 bytes): min multiplier
-// - scales[12]: packed 6-bit scales and mins for 8 sub-blocks
-// - qs[128]: packed 4-bit quantized values
+// - offset 0: d (f16, 2 bytes) + dmin (f16, 2 bytes) = 1 u32
+// - offset 4: scales[12] = 3 u32s
+// - offset 16: qs[128] = 32 u32s
 
 struct Params {
-  N: u32,           // Output dimension (columns)
-  K: u32,           // Input dimension (rows of W)
+  N: u32,
+  K: u32,
   _pad1: u32,
   _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> W_quant: array<u32>;  // Raw Q4_K bytes as u32
+@group(0) @binding(1) var<storage, read> W_quant: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-// Constants - use powers of 2 for bit operations
-const BLOCK_SIZE: u32 = 256u;      // Q4_K block size
-const BLOCK_SIZE_SHIFT: u32 = 8u;  // log2(256) = 8
-const BLOCK_SIZE_MASK: u32 = 255u; // 256 - 1
-const BYTES_PER_BLOCK: u32 = 144u;
-const SUBBLOCK_SIZE: u32 = 32u;
-const SUBBLOCK_SHIFT: u32 = 5u;    // log2(32) = 5
-const SUBBLOCK_MASK: u32 = 31u;    // 32 - 1
-
-// Tile configuration
 const WG_SIZE: u32 = 256u;
-const COLS_PER_WG: u32 = 256u;     // Reduced from 1024 to fit weights in shared memory
-const TILE_K: u32 = 8u;            // Process 8 k values per tile
 
-// Shared memory layout:
-// - sharedX[8]: input tile (32 bytes)
-// - sharedW[8 * 256]: dequantized weight tile (8KB)
-// Total: ~8KB, well under 16KB limit
-var<workgroup> sharedX: array<f32, 8>;
-var<workgroup> sharedW: array<f32, 2048>;  // TILE_K * COLS_PER_WG
+var<workgroup> sharedX: array<f32, 256>;
 
-// Read a byte from the quantized array (stored as u32s) - optimized with bit ops
-fn read_byte(byteOffset: u32) -> u32 {
-  let u32Idx = byteOffset >> 2u;           // / 4
-  let byteInU32 = byteOffset & 3u;         // % 4
-  return (W_quant[u32Idx] >> (byteInU32 << 3u)) & 0xFFu;  // byteInU32 * 8
-}
-
-// Read u16 from byte offset (little-endian) - batch read optimization
-fn read_u16(byteOffset: u32) -> u32 {
-  let u32Idx = byteOffset >> 2u;
-  let byteInU32 = byteOffset & 3u;
-  let data = W_quant[u32Idx];
-
-  if (byteInU32 < 3u) {
-    // Both bytes in same u32
-    return (data >> (byteInU32 << 3u)) & 0xFFFFu;
-  } else {
-    // Spans two u32s
-    let lo = (data >> 24u) & 0xFFu;
-    let hi = W_quant[u32Idx + 1u] & 0xFFu;
-    return lo | (hi << 8u);
-  }
-}
-
-// Unpack f16 to f32 - optimized
 fn unpack_f16(packed: u32) -> f32 {
   let sign = (packed >> 15u) & 1u;
   let exp = (packed >> 10u) & 0x1Fu;
   let mant = packed & 0x3FFu;
-
   if (exp == 0u) {
-    if (mant == 0u) {
-      return select(0.0, -0.0, sign == 1u);
-    }
+    if (mant == 0u) { return select(0.0, -0.0, sign == 1u); }
     return select(1.0, -1.0, sign == 1u) * f32(mant) * 5.960464478e-8;
   } else if (exp == 31u) {
     return select(1.0, -1.0, sign == 1u) * 65504.0;
   }
-
   let e = i32(exp) - 15;
   let m = 1.0 + f32(mant) / 1024.0;
   return select(1.0, -1.0, sign == 1u) * m * pow(2.0, f32(e));
-}
-
-// Get scale and min for sub-block j (0..7) - optimized with bit ops
-fn get_scale_min(blockByteOffset: u32, j: u32) -> vec2<u32> {
-  let scalesOffset = blockByteOffset + 4u;
-  var sc: u32;
-  var mn: u32;
-
-  if (j < 4u) {
-    sc = read_byte(scalesOffset + j) & 0x3Fu;
-    mn = read_byte(scalesOffset + j + 4u) & 0x3Fu;
-  } else {
-    let jm4 = j - 4u;
-    sc = (read_byte(scalesOffset + j + 4u) & 0x0Fu) | ((read_byte(scalesOffset + jm4) >> 6u) << 4u);
-    mn = (read_byte(scalesOffset + j + 4u) >> 4u) | ((read_byte(scalesOffset + j) >> 6u) << 4u);
-  }
-
-  return vec2<u32>(sc, mn);
-}
-
-// Dequantize a single weight - optimized with bit operations
-fn dequant_weight_q4k_opt(k: u32, n: u32, K: u32) -> f32 {
-  let linearIdx = n * K + k;
-  let blockIdx = linearIdx >> BLOCK_SIZE_SHIFT;      // / 256
-  let posInBlock = linearIdx & BLOCK_SIZE_MASK;      // % 256
-  let blockByteOffset = blockIdx * BYTES_PER_BLOCK;
-
-  // Read d and dmin from block header
-  let dBits = read_u16(blockByteOffset);
-  let dminBits = read_u16(blockByteOffset + 2u);
-  let d = unpack_f16(dBits);
-  let dmin = unpack_f16(dminBits);
-
-  // Determine sub-block (0..7) and position using bit ops
-  let subBlock = posInBlock >> SUBBLOCK_SHIFT;       // / 32
-  let posInSubBlock = posInBlock & SUBBLOCK_MASK;    // % 32
-
-  // Get scale and min for this sub-block
-  let scaleMins = get_scale_min(blockByteOffset, subBlock);
-  let scale = f32(scaleMins.x);
-  let mn = f32(scaleMins.y);
-
-  // Read 4-bit quantized value
-  let qsOffset = blockByteOffset + 16u;
-  let byteIndex = ((subBlock >> 1u) << 5u) + posInSubBlock;  // (subBlock/2)*32 + pos
-  let qByte = read_byte(qsOffset + byteIndex);
-  let q = select(qByte & 0x0Fu, qByte >> 4u, (subBlock & 1u) != 0u);
-
-  return d * scale * f32(q) - dmin * mn;
 }
 
 @compute @workgroup_size(256)
@@ -176,56 +82,119 @@ fn main(
   let N = params.N;
   let K = params.K;
 
-  // Each workgroup handles COLS_PER_WG output columns
-  // Each thread handles 1 column (simpler access pattern)
-  let col = wid.x * COLS_PER_WG + tid;
-  let colValid = col < N;
+  // Each thread handles ONE output column
+  let col = wid.x * WG_SIZE + tid;
 
   var acc: f32 = 0.0;
+  let blocksPerCol = K >> 8u;  // K / 256
 
-  let numTilesK = (K + TILE_K - 1u) / TILE_K;
+  for (var blk = 0u; blk < blocksPerCol; blk++) {
+    let kBase = blk << 8u;
 
-  for (var tileK = 0u; tileK < numTilesK; tileK++) {
-    let kStart = tileK * TILE_K;
-    let kEnd = min(kStart + TILE_K, K);
-    let tileLen = kEnd - kStart;
-
-    // Step 1: Cooperative load of x into shared memory
-    if (tid < TILE_K && kStart + tid < K) {
-      sharedX[tid] = x[kStart + tid];
-    }
-
-    // Step 2: Cooperative dequantization of weight tile into shared memory
-    // Each thread dequantizes TILE_K weights for one column
-    // Total: 256 threads × 8 weights = 2048 values
-    if (colValid) {
-      for (var kOffset = 0u; kOffset < TILE_K && kStart + kOffset < K; kOffset++) {
-        let k = kStart + kOffset;
-        let wIdx = kOffset * COLS_PER_WG + tid;
-        sharedW[wIdx] = dequant_weight_q4k_opt(k, col, K);
-      }
-    } else {
-      // Invalid threads still need to participate but write zeros
-      for (var kOffset = 0u; kOffset < TILE_K; kOffset++) {
-        let wIdx = kOffset * COLS_PER_WG + tid;
-        sharedW[wIdx] = 0.0;
-      }
-    }
+    // Cooperative load of 256 x values into shared memory
+    sharedX[tid] = x[kBase + tid];
     workgroupBarrier();
 
-    // Step 3: Accumulate from shared memory
-    if (colValid) {
-      for (var kOffset = 0u; kOffset < tileLen; kOffset++) {
-        let xVal = sharedX[kOffset];
-        let wVal = sharedW[kOffset * COLS_PER_WG + tid];
-        acc += xVal * wVal;
+    if (col < N) {
+      // Calculate block u32 offset (144 bytes = 36 u32s per block, 4-byte aligned)
+      let blockIdx = col * blocksPerCol + blk;
+      let blockU32Idx = blockIdx * 36u;
+
+      // Read d and dmin in ONE u32 read (both f16 packed together)
+      let dPacked = W_quant[blockU32Idx];
+      let d = unpack_f16(dPacked & 0xFFFFu);
+      let dmin = unpack_f16(dPacked >> 16u);
+
+      // Read all 12 scale bytes as 3 u32s
+      let sc0 = W_quant[blockU32Idx + 1u];  // scales[0..3]
+      let sc1 = W_quant[blockU32Idx + 2u];  // scales[4..7]
+      let sc2 = W_quant[blockU32Idx + 3u];  // scales[8..11]
+
+      // Extract 6-bit scales and mins for all 8 sub-blocks
+      // Sub-blocks 0-3: simple extraction from low 6 bits
+      let sc0_0 = sc0 & 0x3Fu;
+      let sc0_1 = (sc0 >> 8u) & 0x3Fu;
+      let sc0_2 = (sc0 >> 16u) & 0x3Fu;
+      let sc0_3 = (sc0 >> 24u) & 0x3Fu;
+      let mn0_0 = sc1 & 0x3Fu;
+      let mn0_1 = (sc1 >> 8u) & 0x3Fu;
+      let mn0_2 = (sc1 >> 16u) & 0x3Fu;
+      let mn0_3 = (sc1 >> 24u) & 0x3Fu;
+
+      // Sub-blocks 4-7: combined extraction (high bits from sc0/sc1, low bits from sc2)
+      // High 2 bits: scales[i] bits 6-7 need to become result bits 4-5
+      // For scales[0] bits 6-7 at sc0 bits 6-7: (sc0 >> 2) & 0x30 puts them at bits 4-5
+      // For scales[1] bits 6-7 at sc0 bits 14-15: (sc0 >> 10) & 0x30
+      // For scales[2] bits 6-7 at sc0 bits 22-23: (sc0 >> 18) & 0x30
+      // For scales[3] bits 6-7 at sc0 bits 30-31: (sc0 >> 26) & 0x30
+      let sc0_4 = (sc2 & 0x0Fu) | ((sc0 >> 2u) & 0x30u);
+      let sc0_5 = ((sc2 >> 8u) & 0x0Fu) | ((sc0 >> 10u) & 0x30u);
+      let sc0_6 = ((sc2 >> 16u) & 0x0Fu) | ((sc0 >> 18u) & 0x30u);
+      let sc0_7 = ((sc2 >> 24u) & 0x0Fu) | ((sc0 >> 26u) & 0x30u);
+      let mn0_4 = ((sc2 >> 4u) & 0x0Fu) | ((sc1 >> 2u) & 0x30u);
+      let mn0_5 = ((sc2 >> 12u) & 0x0Fu) | ((sc1 >> 10u) & 0x30u);
+      let mn0_6 = ((sc2 >> 20u) & 0x0Fu) | ((sc1 >> 18u) & 0x30u);
+      let mn0_7 = ((sc2 >> 28u) & 0x0Fu) | ((sc1 >> 26u) & 0x30u);
+
+      // Pre-compute d*scale and dmin*min for all 8 sub-blocks
+      let ds0 = d * f32(sc0_0); let dm0 = dmin * f32(mn0_0);
+      let ds1 = d * f32(sc0_1); let dm1 = dmin * f32(mn0_1);
+      let ds2 = d * f32(sc0_2); let dm2 = dmin * f32(mn0_2);
+      let ds3 = d * f32(sc0_3); let dm3 = dmin * f32(mn0_3);
+      let ds4 = d * f32(sc0_4); let dm4 = dmin * f32(mn0_4);
+      let ds5 = d * f32(sc0_5); let dm5 = dmin * f32(mn0_5);
+      let ds6 = d * f32(sc0_6); let dm6 = dmin * f32(mn0_6);
+      let ds7 = d * f32(sc0_7); let dm7 = dmin * f32(mn0_7);
+
+      // qs array starts at offset 16 bytes = 4 u32s from block start
+      let qsU32Base = blockU32Idx + 4u;
+
+      // Process 4 pairs of sub-blocks (0&1, 2&3, 4&5, 6&7)
+      // Each pair shares the same 32 qs bytes (8 u32s)
+      for (var pair = 0u; pair < 4u; pair++) {
+        let kOff = pair * 64u;
+
+        // Select pre-computed scales for this pair
+        var dsE: f32; var dmE: f32; var dsO: f32; var dmO: f32;
+        if (pair == 0u) { dsE = ds0; dmE = dm0; dsO = ds1; dmO = dm1; }
+        else if (pair == 1u) { dsE = ds2; dmE = dm2; dsO = ds3; dmO = dm3; }
+        else if (pair == 2u) { dsE = ds4; dmE = dm4; dsO = ds5; dmO = dm5; }
+        else { dsE = ds6; dmE = dm6; dsO = ds7; dmO = dm7; }
+
+        // Read 8 u32s (32 bytes) for this sub-block pair
+        let qsBase = qsU32Base + pair * 8u;
+
+        for (var w = 0u; w < 8u; w++) {
+          let packed = W_quant[qsBase + w];
+
+          // Extract 8 4-bit q values from this u32
+          let q0 = packed & 0xFu;
+          let q1 = (packed >> 4u) & 0xFu;
+          let q2 = (packed >> 8u) & 0xFu;
+          let q3 = (packed >> 12u) & 0xFu;
+          let q4 = (packed >> 16u) & 0xFu;
+          let q5 = (packed >> 20u) & 0xFu;
+          let q6 = (packed >> 24u) & 0xFu;
+          let q7 = (packed >> 28u) & 0xFu;
+
+          // Low nibbles (q0,q2,q4,q6) go to even sub-block
+          // High nibbles (q1,q3,q5,q7) go to odd sub-block
+          let idx = kOff + w * 4u;
+          acc += sharedX[idx] * (dsE * f32(q0) - dmE);
+          acc += sharedX[idx + 1u] * (dsE * f32(q2) - dmE);
+          acc += sharedX[idx + 2u] * (dsE * f32(q4) - dmE);
+          acc += sharedX[idx + 3u] * (dsE * f32(q6) - dmE);
+          acc += sharedX[idx + 32u] * (dsO * f32(q1) - dmO);
+          acc += sharedX[idx + 33u] * (dsO * f32(q3) - dmO);
+          acc += sharedX[idx + 34u] * (dsO * f32(q5) - dmO);
+          acc += sharedX[idx + 35u] * (dsO * f32(q7) - dmO);
+        }
       }
     }
     workgroupBarrier();
   }
 
-  // Write output
-  if (colValid) {
+  if (col < N) {
     output[col] = acc;
   }
 }

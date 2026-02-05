@@ -15,7 +15,7 @@ import {
 } from '../shader.js';
 import { createUniformBufferWithData } from '../buffer.js';
 import { matmul, softmax, mulScalar } from '../ops/index.js';
-import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemmQ8_0, gemmQ4_K, fusedFFNGateUpQ4K } from '../quant/index.js';
+import { QuantizedTensor, gemvQ8_0, gemvQ4_K_optimized, gemvQ6_K, gemmQ8_0, gemmQ4_K, gemmQ6_K, fusedFFNGateUpQ4K, fusedFFNGateUpQ6K } from '../quant/index.js';
 import { GGMLType } from '../../../types/model.js';
 import { debugLog, isDebugEnabled } from '../debug.js';
 
@@ -645,10 +645,12 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
         result = await gemvQ8_0(x, w);
       } else if (w.quantType === GGMLType.Q4_K) {
         result = await gemvQ4_K_optimized(x, w);
+      } else if (w.quantType === GGMLType.Q6_K) {
+        result = await gemvQ6_K(x, w);
       } else {
         throw new Error(
           `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
-          `Supported: Q8_0, Q4_K`
+          `Supported: Q8_0, Q4_K, Q6_K`
         );
       }
     } else {
@@ -657,10 +659,12 @@ export async function matmulQ(x: Tensor, w: WeightTensor): Promise<Tensor> {
         result = await gemmQ8_0(x, w);
       } else if (w.quantType === GGMLType.Q4_K) {
         result = await gemmQ4_K(x, w);
+      } else if (w.quantType === GGMLType.Q6_K) {
+        result = await gemmQ6_K(x, w);
       } else {
         throw new Error(
           `Unsupported quantization type: ${QuantizedTensor.getTypeName(w.quantType)}. ` +
-          `Supported: Q8_0, Q4_K`
+          `Supported: Q8_0, Q4_K, Q6_K (GEMV only)`
         );
       }
     }
@@ -720,16 +724,35 @@ export async function feedForwardQ(
     return feedForward(x, wGate as Tensor, wUp as Tensor, wDown as Tensor);
   }
 
-  // Check if we can use fused kernel (M=1, all Q4_K)
+  // Check if we can use fused kernel (M=1, all same quant type)
   const M = x.shape[0];
   const allQ4K =
     wGate instanceof QuantizedTensor && wGate.quantType === GGMLType.Q4_K &&
     wUp instanceof QuantizedTensor && wUp.quantType === GGMLType.Q4_K &&
     wDown instanceof QuantizedTensor && wDown.quantType === GGMLType.Q4_K;
 
+  const allQ6K =
+    wGate instanceof QuantizedTensor && wGate.quantType === GGMLType.Q6_K &&
+    wUp instanceof QuantizedTensor && wUp.quantType === GGMLType.Q6_K &&
+    wDown instanceof QuantizedTensor && wDown.quantType === GGMLType.Q6_K;
+
   if (allQ4K && M === 1) {
-    // Fused path: single kernel computes SiLU(x @ Wgate) * (x @ Wup)
+    // Fused Q4_K path: single kernel computes SiLU(x @ Wgate) * (x @ Wup)
     const hidden = await fusedFFNGateUpQ4K(
+      x,
+      wGate as QuantizedTensor,
+      wUp as QuantizedTensor
+    );
+
+    // output = hidden @ W_down (still separate)
+    const output = await matmulQ(hidden, wDown);
+    hidden.destroy();
+    return output;
+  }
+
+  if (allQ6K && M === 1) {
+    // Fused Q6_K path: single kernel computes SiLU(x @ Wgate) * (x @ Wup)
+    const hidden = await fusedFFNGateUpQ6K(
       x,
       wGate as QuantizedTensor,
       wUp as QuantizedTensor

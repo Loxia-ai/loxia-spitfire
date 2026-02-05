@@ -15,6 +15,7 @@ import { getBlockSize, getBytesPerBlock } from './index.js';
 export type SupportedQuantType =
   | GGMLType.Q4_0
   | GGMLType.Q4_K
+  | GGMLType.Q6_K
   | GGMLType.Q8_0;
 
 /**
@@ -173,6 +174,7 @@ export class QuantizedTensor {
     return (
       type === GGMLType.Q4_0 ||
       type === GGMLType.Q4_K ||
+      type === GGMLType.Q6_K ||
       type === GGMLType.Q8_0
     );
   }
@@ -269,6 +271,7 @@ export class QuantizedTensor {
     switch (type) {
       case GGMLType.Q4_0: return 'Q4_0';
       case GGMLType.Q4_K: return 'Q4_K';
+      case GGMLType.Q6_K: return 'Q6_K';
       case GGMLType.Q8_0: return 'Q8_0';
       default: return 'Unknown';
     }
